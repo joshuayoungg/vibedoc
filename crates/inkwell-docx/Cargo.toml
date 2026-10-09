@@ -1,0 +1,10 @@
+[package]
+name = "inkwell-docx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+inkwell-core = { version = "0.1.0", path = "../inkwell-core" }
+quick-xml = "0.42.0"
+zip = "8.6.0"

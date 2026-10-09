@@ -1,0 +1,15 @@
+[package]
+name = "inkwell-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "inkwell"
+path = "src/main.rs"
+
+[dependencies]
+eframe = "0.36.2"
+inkwell-core = { version = "0.1.0", path = "../inkwell-core" }
+inkwell-docx = { version = "0.1.0", path = "../inkwell-docx" }
+rfd = "0.17.2"

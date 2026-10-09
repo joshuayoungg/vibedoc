@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["crates/inkwell-core", "crates/inkwell-docx", "crates/inkwell-app", "crates/inkwell-ai"]
+members = ["crates/vibedoc-core", "crates/vibedoc-docx", "crates/vibedoc-app", "crates/vibedoc-ai", "crates/vibedoc-pdf"]
 # `cargo run` starts the app.
-default-members = ["crates/inkwell-app"]
+default-members = ["crates/vibedoc-app"]
 
 [workspace.package]
 version = "0.1.0"

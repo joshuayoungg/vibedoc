@@ -4,7 +4,11 @@
 //! Undo stores whole-document snapshots: simple, and fast enough for
 //! documents people actually write by hand.
 
-use crate::document::{Document, ParagraphKind, Position, Selection, StyleFlag, TextStyle};
+use crate::document::{Document, Image, Paragraph, ParagraphKind, Position, Selection, StyleFlag, TextStyle};
+
+/// Word's font size ladder, used by "grow" and "shrink" and the size menu.
+pub const FONT_SIZES: [f32; 16] =
+    [8.0, 9.0, 10.0, 10.5, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 24.0, 28.0, 32.0, 36.0, 48.0, 72.0];
 
 #[derive(Clone)]
 struct Snapshot {
@@ -191,15 +195,35 @@ impl Editor {
     /// Ctrl+B / Ctrl+I / Ctrl+U. With no selection, it changes what you type next.
     pub fn toggle_style(&mut self, flag: StyleFlag) {
         let turn_on = !self.current_style().get(flag);
+        self.apply_style(|style| style.set(flag, turn_on));
+    }
+
+    /// Changes the style of the selection (font, size, color, ...). With no
+    /// selection, it changes what you type next.
+    pub fn apply_style(&mut self, change: impl Fn(&mut TextStyle)) {
+        change(&mut self.typing_style);
         if self.selection.is_empty() {
-            self.typing_style.set(flag, turn_on);
             return;
         }
         self.record(EditKind::Other);
         let (start, end) = (self.selection.start(), self.selection.end());
-        self.document.restyle(start, end, |style| style.set(flag, turn_on));
-        self.typing_style.set(flag, turn_on);
+        self.document.restyle(start, end, change);
         self.mark_changed();
+    }
+
+    /// Removes all character formatting from the selection.
+    pub fn clear_formatting(&mut self) {
+        self.apply_style(|style| *style = TextStyle::default());
+    }
+
+    /// Makes text bigger or smaller by `steps` sizes on Word's size ladder.
+    pub fn step_font_size(&mut self, steps: i32) {
+        let kind = self.current_paragraph_kind();
+        let current = self.current_style().points(kind);
+        let index = FONT_SIZES.iter().position(|&size| size >= current).unwrap_or(FONT_SIZES.len() - 1);
+        let target = (index as i32 + steps).clamp(0, FONT_SIZES.len() as i32 - 1) as usize;
+        let half_points = (FONT_SIZES[target] * 2.0) as u16;
+        self.apply_style(|style| style.size = Some(half_points));
     }
 
     /// The style shown as "active" in the toolbar.
@@ -209,20 +233,48 @@ impl Editor {
         }
         let (start, end) = (self.selection.start(), self.selection.end());
         let all = |flag| self.document.all_chars_in(start, end, |s| s.get(flag));
+        // Font, size, and color show what the selection starts with.
+        let first = self.document.chars_in(start, end).next().map_or(self.typing_style, |c| c.style);
         TextStyle {
             bold: all(StyleFlag::Bold),
             italic: all(StyleFlag::Italic),
             underline: all(StyleFlag::Underline),
+            strikethrough: all(StyleFlag::Strikethrough),
+            ..first
         }
     }
 
     /// Sets the kind (heading, list, ...) of every paragraph touched by the selection.
     pub fn set_paragraph_kind(&mut self, kind: ParagraphKind) {
+        self.format_paragraphs(|paragraph| paragraph.kind = kind);
+    }
+
+    /// Changes every paragraph touched by the selection, e.g. its alignment.
+    pub fn format_paragraphs(&mut self, change: impl Fn(&mut Paragraph)) {
         self.record(EditKind::Other);
         for index in self.selection.start().paragraph..=self.selection.end().paragraph {
-            self.document.paragraphs[index].kind = kind;
+            change(&mut self.document.paragraphs[index]);
         }
         self.mark_changed();
+    }
+
+    /// Ticks or unticks a checklist item.
+    pub fn toggle_checked(&mut self, paragraph: usize) {
+        if self.document.paragraphs.get(paragraph).is_none_or(|p| p.kind != ParagraphKind::Checklist) {
+            return;
+        }
+        self.record(EditKind::Other);
+        let paragraph = &mut self.document.paragraphs[paragraph];
+        paragraph.checked = !paragraph.checked;
+        self.mark_changed();
+    }
+
+    /// Inserts a picture at the caret, replacing any selection.
+    pub fn insert_image(&mut self, image: Image) {
+        self.record(EditKind::Other);
+        self.delete_selection();
+        let after = self.document.insert_image(self.selection.cursor, image);
+        self.place_caret(after);
     }
 
     /// Swaps in an edited copy of the document (the AI's work) as one undo step.
@@ -234,7 +286,12 @@ impl Editor {
     }
 
     pub fn current_paragraph_kind(&self) -> ParagraphKind {
-        self.document.paragraphs[self.selection.cursor.paragraph].kind
+        self.current_paragraph().kind
+    }
+
+    /// The paragraph with the caret, for showing its formatting in the toolbar.
+    pub fn current_paragraph(&self) -> &Paragraph {
+        &self.document.paragraphs[self.selection.cursor.paragraph]
     }
 
     // ---- Undo / redo ----
@@ -407,6 +464,52 @@ mod tests {
         assert_eq!(text(&e), ["x", "y", "before"]);
         e.undo();
         assert_eq!(text(&e), ["before"]);
+    }
+
+    #[test]
+    fn styling_a_selection_keeps_other_formatting() {
+        let mut e = Editor::default();
+        e.type_text("hello");
+        e.select_all();
+        e.toggle_style(StyleFlag::Bold);
+        e.apply_style(|s| s.font = crate::document::Font::Lora);
+        let style = e.document().paragraphs[0].chars[0].style;
+        assert!(style.bold);
+        assert_eq!(style.font, crate::document::Font::Lora);
+        e.clear_formatting();
+        assert_eq!(e.document().paragraphs[0].chars[0].style, TextStyle::default());
+    }
+
+    #[test]
+    fn font_size_steps_along_the_ladder() {
+        let mut e = Editor::default();
+        e.type_text("x");
+        e.select_all();
+        e.step_font_size(1);
+        assert_eq!(e.current_style().size, Some(28));
+        e.step_font_size(-2);
+        assert_eq!(e.current_style().size, Some(22));
+    }
+
+    #[test]
+    fn checklist_items_tick_and_continue_unticked() {
+        let mut e = Editor::default();
+        e.set_paragraph_kind(ParagraphKind::Checklist);
+        e.type_text("buy milk");
+        e.toggle_checked(0);
+        assert!(e.document().paragraphs[0].checked);
+        e.new_paragraph();
+        assert_eq!(e.current_paragraph_kind(), ParagraphKind::Checklist);
+        assert!(!e.current_paragraph().checked);
+    }
+
+    #[test]
+    fn alignment_carries_over_to_the_next_paragraph() {
+        let mut e = Editor::default();
+        e.format_paragraphs(|p| p.alignment = crate::document::Alignment::Center);
+        e.type_text("title");
+        e.new_paragraph();
+        assert_eq!(e.current_paragraph().alignment, crate::document::Alignment::Center);
     }
 
     #[test]

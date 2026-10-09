@@ -1,8 +1,8 @@
 //! The only ways the AI can change a document. Each tool is a small, typed
 //! edit, so the AI can't produce anything the editor doesn't understand.
 
-use inkwell_core::{Document, Image, PageSetup, Paragraph, ParagraphKind, Position, Selection, StyleFlag};
 use serde_json::{json, Value};
+use vibedoc_core::{Document, Image, PageSetup, Paragraph, ParagraphKind, Position, Selection, StyleFlag};
 
 use crate::models::{ImageModel, ToolCall, ToolSpec};
 use crate::text::{describe_document, parse_markdown};
@@ -18,7 +18,7 @@ pub struct Workspace<'a> {
 pub fn tool_specs() -> Vec<ToolSpec> {
     let kind = json!({
         "type": "string",
-        "enum": ["normal", "heading1", "heading2", "heading3", "bullet", "numbered"],
+        "enum": ["normal", "heading1", "heading2", "heading3", "quote", "code", "bullet", "numbered", "checklist"],
     });
     let paragraph_range = |what: &str| {
         json!({
@@ -154,6 +154,7 @@ impl Workspace<'_> {
                         Ok(Paragraph {
                             kind,
                             chars: parse_markdown(item["text"].as_str().unwrap_or_default()),
+                            ..Default::default()
                         })
                     })
                     .collect::<Result<Vec<_>, String>>()?;
@@ -233,7 +234,7 @@ impl Workspace<'_> {
                 let image = fit_to_page(bytes)?;
                 let mut paragraph = Paragraph::new(ParagraphKind::Normal);
                 let placeholder = self.document.add_image(image);
-                paragraph.chars.push(inkwell_core::StyledChar { ch: placeholder, style: Default::default() });
+                paragraph.chars.push(vibedoc_core::StyledChar { ch: placeholder, style: Default::default() });
                 let index = self.insert_after(&input["after_paragraph"], vec![paragraph])?;
                 Ok(format!("Inserted the image as paragraph {index}."))
             }
@@ -348,6 +349,9 @@ fn parse_kind(value: &Value) -> Result<ParagraphKind, String> {
         Some("heading3") => ParagraphKind::Heading3,
         Some("bullet") => ParagraphKind::Bullet,
         Some("numbered") => ParagraphKind::Numbered,
+        Some("quote") => ParagraphKind::Quote,
+        Some("code") => ParagraphKind::Code,
+        Some("checklist") => ParagraphKind::Checklist,
         _ => return Err(format!("Unknown paragraph kind {value}.")),
     })
 }

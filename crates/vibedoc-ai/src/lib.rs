@@ -1,4 +1,4 @@
-//! Inkwell's assistant: turns requests like "put this list in a doc" or
+//! VibeDoc's assistant: turns requests like "put this list in a doc" or
 //! "draw a picture here" into typed edits on the document.
 //!
 //! Models are pluggable. Chat: Claude or any OpenAI-compatible service.

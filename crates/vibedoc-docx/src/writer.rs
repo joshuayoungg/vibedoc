@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::io::{Seek, Write};
 
-use inkwell_core::{Document, Image, Paragraph, ParagraphKind, TextStyle};
+use vibedoc_core::{
+    Alignment, Document, Font, Image, LineSpacing, Paragraph, ParagraphKind, Script, TextStyle,
+};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
@@ -111,25 +113,52 @@ fn document_body(document: &Document, media: &Media) -> (String, usize) {
 }
 
 fn paragraph_xml(paragraph: &Paragraph, numbered_list_id: usize, media: &Media) -> String {
-    let properties = match paragraph.kind {
+    // Properties must come in the order Word's schema lists them.
+    let mut properties = match paragraph.kind {
         ParagraphKind::Normal => String::new(),
         ParagraphKind::Heading1 => style_property("Heading1"),
         ParagraphKind::Heading2 => style_property("Heading2"),
         ParagraphKind::Heading3 => style_property("Heading3"),
+        ParagraphKind::Quote => style_property("Quote"),
+        ParagraphKind::Code => style_property("Code"),
+        ParagraphKind::Checklist => style_property("Checklist"),
         ParagraphKind::Bullet => list_properties(BULLET_NUM_ID),
         ParagraphKind::Numbered => list_properties(numbered_list_id),
     };
+    if paragraph.spacing != LineSpacing::Single {
+        // Word measures "auto" line spacing in 240ths of a line.
+        let line = (paragraph.spacing.factor() * 240.0).round();
+        properties.push_str(&format!(r#"<w:spacing w:line="{line}" w:lineRule="auto"/>"#));
+    }
+    let justification = match paragraph.alignment {
+        Alignment::Left => None,
+        Alignment::Center => Some("center"),
+        Alignment::Right => Some("right"),
+        Alignment::Justify => Some("both"),
+    };
+    if let Some(value) = justification {
+        properties.push_str(&format!(r#"<w:jc w:val="{value}"/>"#));
+    }
+    if !properties.is_empty() {
+        properties = format!("<w:pPr>{properties}</w:pPr>");
+    }
+    // Word has no checklists, so the box is written as a character it can show.
+    let checkbox = match (paragraph.kind, paragraph.checked) {
+        (ParagraphKind::Checklist, true) => text_run_xml(TextStyle::default(), "☒ "),
+        (ParagraphKind::Checklist, false) => text_run_xml(TextStyle::default(), "☐ "),
+        _ => String::new(),
+    };
     let runs: String = paragraph.runs().iter().map(|(style, text)| runs_xml(*style, text, media)).collect();
-    format!("<w:p>{properties}{runs}</w:p>")
+    format!("<w:p>{properties}{checkbox}{runs}</w:p>")
 }
 
 fn style_property(style_id: &str) -> String {
-    format!(r#"<w:pPr><w:pStyle w:val="{style_id}"/></w:pPr>"#)
+    format!(r#"<w:pStyle w:val="{style_id}"/>"#)
 }
 
 fn list_properties(num_id: usize) -> String {
     format!(
-        r#"<w:pPr><w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{num_id}"/></w:numPr></w:pPr>"#
+        r#"<w:pStyle w:val="ListParagraph"/><w:numPr><w:ilvl w:val="0"/><w:numId w:val="{num_id}"/></w:numPr>"#
     )
 }
 
@@ -154,16 +183,48 @@ fn text_run_xml(style: TextStyle, text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
+    text_run_with(&run_properties(style), text)
+}
+
+/// The `<w:rPr>` contents for a style, in the order Word's schema wants.
+fn run_properties(style: TextStyle) -> String {
     let mut properties = String::new();
+    if style.font != Font::default() {
+        let name = style.font.name();
+        properties.push_str(&format!(r#"<w:rFonts w:ascii="{name}" w:hAnsi="{name}" w:cs="{name}"/>"#));
+    }
     if style.bold {
         properties.push_str("<w:b/>");
     }
     if style.italic {
         properties.push_str("<w:i/>");
     }
+    if style.strikethrough {
+        properties.push_str("<w:strike/>");
+    }
+    if let Some(color) = style.color {
+        properties.push_str(&format!(r#"<w:color w:val="{}"/>"#, color.hex()));
+    }
+    if let Some(size) = style.size {
+        properties.push_str(&format!(r#"<w:sz w:val="{size}"/><w:szCs w:val="{size}"/>"#));
+    }
     if style.underline {
         properties.push_str(r#"<w:u w:val="single"/>"#);
     }
+    if let Some(highlight) = style.highlight {
+        properties
+            .push_str(&format!(r#"<w:shd w:val="clear" w:color="auto" w:fill="{}"/>"#, highlight.hex()));
+    }
+    match style.script {
+        Script::Normal => {}
+        Script::Superscript => properties.push_str(r#"<w:vertAlign w:val="superscript"/>"#),
+        Script::Subscript => properties.push_str(r#"<w:vertAlign w:val="subscript"/>"#),
+    }
+    properties
+}
+
+fn text_run_with(properties: &str, text: &str) -> String {
+    let mut properties = properties.to_string();
     if !properties.is_empty() {
         properties = format!("<w:rPr>{properties}</w:rPr>");
     }
@@ -209,7 +270,7 @@ const DOCUMENT_START: &str = concat!(
 const DOCUMENT_END: &str = r#"<w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/></w:sectPr></w:body></w:document>"#;
 
 const STYLES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="24"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="120"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:sz w:val="44"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:b/><w:sz w:val="34"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:outlineLvl w:val="2"/></w:pPr><w:rPr><w:b/><w:sz w:val="28"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:after="40"/><w:ind w:left="720"/></w:pPr></w:style></w:styles>"#;
+<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii="Calibri" w:hAnsi="Calibri"/><w:sz w:val="24"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="120"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:outlineLvl w:val="0"/></w:pPr><w:rPr><w:b/><w:sz w:val="44"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:outlineLvl w:val="1"/></w:pPr><w:rPr><w:b/><w:sz w:val="34"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading3"><w:name w:val="heading 3"/><w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:pPr><w:keepNext/><w:outlineLvl w:val="2"/></w:pPr><w:rPr><w:b/><w:sz w:val="28"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Quote"><w:name w:val="Quote"/><w:basedOn w:val="Normal"/><w:pPr><w:pBdr><w:left w:val="single" w:sz="18" w:space="8" w:color="C7CBD6"/></w:pBdr><w:ind w:left="360"/></w:pPr><w:rPr><w:i/><w:color w:val="555B6E"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Code"><w:name w:val="Code"/><w:basedOn w:val="Normal"/><w:pPr><w:shd w:val="clear" w:color="auto" w:fill="F3F4F6"/><w:spacing w:after="0"/><w:ind w:left="200"/></w:pPr><w:rPr><w:rFonts w:ascii="JetBrains Mono" w:hAnsi="JetBrains Mono" w:cs="JetBrains Mono"/><w:sz w:val="22"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Checklist"><w:name w:val="Checklist"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:after="40"/><w:ind w:left="360"/></w:pPr></w:style><w:style w:type="paragraph" w:styleId="ListParagraph"><w:name w:val="List Paragraph"/><w:basedOn w:val="Normal"/><w:pPr><w:spacing w:after="40"/><w:ind w:left="720"/></w:pPr></w:style></w:styles>"#;
 
 const NUMBERING_START: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:numbering xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="bullet"/><w:lvlText w:val="•"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum><w:abstractNum w:abstractNumId="1"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl></w:abstractNum>"#;

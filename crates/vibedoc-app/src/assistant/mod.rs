@@ -1,37 +1,89 @@
-//! The assistant's UI: a chat side panel, the Ctrl+K command bar, and settings.
-//! The actual work happens in the `inkwell-ai` crate, on a background thread.
+//! The assistant's UI: a side panel of review cards (one per request, each
+//! with its changes and an Undo), the Ctrl+K command bar, and settings.
+//! The actual work happens in the `vibedoc-ai` crate, on a background thread.
+//!
+//! Each open document has its own [`Conversation`], so a request keeps
+//! working on the document it was asked about even after switching tabs.
 
+mod command_bar;
+mod diff_view;
+mod panel;
+mod settings;
+
+use std::ops::Range;
 use std::sync::mpsc::Receiver;
 
-use eframe::egui::{
-    self, Align, Button, Color32, ComboBox, Key, KeyboardShortcut, Layout, Modifiers, RichText, ScrollArea,
-    TextEdit, Ui,
-};
-use inkwell_ai::config::{AgentConfig, AgentProvider, ImageConfig, ImageProvider};
-use inkwell_ai::{AgentEvent, Config, Turn};
-use inkwell_core::{Document, Editor, Selection};
+use eframe::egui;
+use vibedoc_ai::{AgentEvent, Config, Turn};
+use vibedoc_core::changes::{diff, locate, revert, Hunk};
+use vibedoc_core::{Document, Editor, Selection};
 
+/// What's shared by every document: the configuration and the panel's own state.
 pub struct Assistant {
     pub panel_open: bool,
     config: Config,
-    entries: Vec<Entry>,
     input: String,
-    running: Option<Receiver<AgentEvent>>,
-    progress: String,
     command_bar: Option<String>,
-    settings: Option<Settings>,
+    settings: Option<settings::Settings>,
     input_has_focus: bool,
+    /// Shown above the cards, e.g. when the settings file couldn't be read.
+    notice: Option<String>,
 }
 
+/// One document's requests and their changes.
+#[derive(Default)]
+pub struct Conversation {
+    entries: Vec<Entry>,
+    running: Option<Running>,
+    progress: String,
+    /// Paragraphs to tint on the page: the changes of the card being looked at.
+    highlights: Vec<Range<usize>>,
+    /// The document revision right after the latest change was applied. Until
+    /// the next edit, that change stays highlighted so it's easy to spot.
+    fresh_change: Option<u64>,
+    just_finished: bool,
+}
+
+struct Running {
+    receiver: Receiver<AgentEvent>,
+    /// The document as it was when the request was sent.
+    before: Document,
+}
+
+/// One request and what came of it.
 struct Entry {
     request: String,
     reply: String,
-    failed: bool,
+    outcome: Outcome,
+    details_open: bool,
 }
 
-struct Settings {
-    draft: Config,
-    error: Option<String>,
+enum Outcome {
+    Working,
+    Failed,
+    Cancelled,
+    /// Finished without touching the document, e.g. a question.
+    Answered,
+    Changed(Change),
+}
+
+/// What one request did to the document, kept so it can be shown and undone.
+struct Change {
+    before: Document,
+    after: Document,
+    hunks: Vec<Hunk>,
+    /// `state` for the document revision it was worked out for.
+    cached: Option<(u64, ChangeState)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ChangeState {
+    /// In the document. These paragraphs are what the assistant wrote.
+    Applied(Vec<Range<usize>>),
+    /// Taken back out.
+    Undone,
+    /// The changed paragraphs were edited again, so it can't be undone here.
+    EditedSince,
 }
 
 /// What the assistant finished, for the app to apply to the editor.
@@ -40,346 +92,186 @@ pub struct Finished {
     pub selection: Selection,
 }
 
-const EXAMPLES: [&str; 4] = [
-    "Turn my notes into a bulleted list",
-    "Make the selected text bold",
-    "Draw a watercolor fox and put it here",
-    "Add a title and a short intro",
-];
+/// Something the panel asks the app to do.
+pub enum Action {
+    /// Swap in this document as one undo step (undoing or redoing a change).
+    Apply(Document),
+    /// Scroll the page to this paragraph.
+    Reveal(usize),
+}
 
 impl Default for Assistant {
     fn default() -> Self {
-        let (config, load_error) = match Config::load() {
+        let (config, notice) = match Config::load() {
             Ok(config) => (config, None),
-            Err(error) => (Config::default(), Some(error)),
+            Err(error) => (
+                Config::default(),
+                Some(format!("Your settings file couldn't be read, so defaults are in use: {error}")),
+            ),
         };
-        let mut assistant = Assistant {
+        Assistant {
             panel_open: true,
             config,
-            entries: Vec::new(),
             input: String::new(),
-            running: None,
-            progress: String::new(),
             command_bar: None,
             settings: None,
             input_has_focus: false,
-        };
-        if let Some(error) = load_error {
-            assistant.entries.push(Entry {
-                request: "(loading settings)".into(),
-                reply: format!("Your settings file couldn't be read, so defaults are in use: {error}"),
-                failed: true,
-            });
+            notice,
         }
-        assistant
     }
 }
 
-impl Assistant {
+impl Change {
+    fn new(before: Document, after: Document) -> Change {
+        let hunks = diff(&before, &after);
+        Change { before, after, hunks, cached: None }
+    }
+
+    /// Where this change stands in the editor's document right now.
+    fn state(&mut self, editor: &Editor) -> &ChangeState {
+        let revision = editor.revision();
+        if self.cached.as_ref().is_none_or(|(at, _)| *at != revision) {
+            let current = editor.document();
+            let state = if let Some(ranges) = locate(&self.hunks, &self.after, current) {
+                ChangeState::Applied(ranges)
+            } else if locate(&self.undo_hunks(), &self.before, current).is_some() {
+                ChangeState::Undone
+            } else {
+                ChangeState::EditedSince
+            };
+            self.cached = Some((revision, state));
+        }
+        &self.cached.as_ref().expect("just computed").1
+    }
+
+    /// The same change seen backwards, from `after` to `before`.
+    fn undo_hunks(&self) -> Vec<Hunk> {
+        self.hunks.iter().map(|h| Hunk { before: h.after.clone(), after: h.before.clone() }).collect()
+    }
+
+    /// Paragraphs added (or rewritten) and removed.
+    fn counts(&self) -> (usize, usize) {
+        let added = self.hunks.iter().map(|h| h.after.len()).sum();
+        let removed = self.hunks.iter().map(|h| h.before.len()).sum();
+        (added, removed)
+    }
+
+    /// The document with this change taken out, or put back in.
+    fn toggled(&self, current: &Document, undo: bool) -> Option<Document> {
+        if undo {
+            revert(&self.before, &self.after, current)
+        } else {
+            revert(&self.after, &self.before, current)
+        }
+    }
+}
+
+impl Conversation {
     pub fn is_running(&self) -> bool {
         self.running.is_some()
     }
 
+    /// Paragraphs to tint on the page, worked out when the panel was drawn.
+    pub fn highlights(&self) -> &[Range<usize>] {
+        &self.highlights
+    }
+
+    pub fn cancel(&mut self) {
+        // The background thread finishes on its own; its result is ignored.
+        if self.running.take().is_some() {
+            self.finish_last("Cancelled.".into(), Outcome::Cancelled);
+        }
+    }
+
+    /// Earlier exchanges, so follow-ups like "make it shorter" work.
+    fn history(&mut self, editor: &Editor) -> Vec<Turn> {
+        let mut turns = Vec::new();
+        for entry in &mut self.entries {
+            let reply = match &mut entry.outcome {
+                Outcome::Answered => entry.reply.clone(),
+                Outcome::Changed(change) => match change.state(editor) {
+                    ChangeState::Undone => {
+                        format!("{} (The user has since undone this change.)", entry.reply)
+                    }
+                    _ => entry.reply.clone(),
+                },
+                Outcome::Working | Outcome::Failed | Outcome::Cancelled => continue,
+            };
+            turns.push(Turn { request: entry.request.clone(), reply });
+        }
+        turns
+    }
+
+    /// Checks on the background work. Returns the result once it's done.
+    pub fn poll(&mut self) -> Option<Finished> {
+        let running = self.running.as_ref()?;
+        while let Ok(event) = running.receiver.try_recv() {
+            match event {
+                AgentEvent::Progress(note) => self.progress = note,
+                AgentEvent::Finished { document, selection, reply } => {
+                    let before = self.running.take().expect("running").before;
+                    let outcome = if document == before {
+                        Outcome::Answered
+                    } else {
+                        self.just_finished = true;
+                        Outcome::Changed(Change::new(before, document.clone()))
+                    };
+                    self.finish_last(reply, outcome);
+                    return Some(Finished { document, selection });
+                }
+                AgentEvent::Failed(error) => {
+                    self.running = None;
+                    self.finish_last(error, Outcome::Failed);
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
+    fn finish_last(&mut self, reply: String, outcome: Outcome) {
+        if let Some(entry) = self.entries.last_mut() {
+            entry.reply = if reply.trim().is_empty() { "Done.".into() } else { reply };
+            entry.outcome = outcome;
+        }
+    }
+}
+
+impl Assistant {
     /// True while one of the assistant's text boxes or windows wants the keyboard.
     pub fn wants_keyboard(&self) -> bool {
         self.input_has_focus || self.command_bar.is_some() || self.settings.is_some()
     }
 
-    pub fn open_command_bar(&mut self) {
-        if self.command_bar.is_none() {
-            self.command_bar = Some(String::new());
-        }
-    }
-
-    pub fn cancel(&mut self) {
-        // The background thread finishes on its own; its result is ignored.
-        self.running = None;
-    }
-
-    pub fn submit(&mut self, request: String, editor: &Editor, ctx: &egui::Context) {
+    pub fn submit(
+        &mut self,
+        conversation: &mut Conversation,
+        request: String,
+        editor: &Editor,
+        ctx: &egui::Context,
+    ) {
         let request = request.trim().to_string();
-        if request.is_empty() || self.is_running() {
+        if request.is_empty() || conversation.is_running() {
             return;
         }
-        let history: Vec<Turn> = self
-            .entries
-            .iter()
-            .filter(|e| !e.failed)
-            .map(|e| Turn { request: e.request.clone(), reply: e.reply.clone() })
-            .collect();
-        self.entries.push(Entry { request: request.clone(), reply: String::new(), failed: false });
+        let history = conversation.history(editor);
+        conversation.entries.push(Entry {
+            request: request.clone(),
+            reply: String::new(),
+            outcome: Outcome::Working,
+            details_open: false,
+        });
         let ctx = ctx.clone();
-        self.running = Some(inkwell_ai::spawn(
+        let receiver = vibedoc_ai::spawn(
             self.config.clone(),
             request,
             history,
             editor.document().clone(),
             editor.selection(),
             move || ctx.request_repaint(),
-        ));
-        self.progress = "Starting…".into();
+        );
+        conversation.running = Some(Running { receiver, before: editor.document().clone() });
+        conversation.progress = "Starting…".into();
         self.panel_open = true;
     }
-
-    /// Checks on the background work. Returns the result once it's done.
-    pub fn poll(&mut self) -> Option<Finished> {
-        let receiver = self.running.as_ref()?;
-        let mut finished = None;
-        while let Ok(event) = receiver.try_recv() {
-            match event {
-                AgentEvent::Progress(note) => self.progress = note,
-                AgentEvent::Finished { document, selection, reply } => {
-                    self.set_last_reply(reply, false);
-                    finished = Some(Finished { document, selection });
-                    self.running = None;
-                    break;
-                }
-                AgentEvent::Failed(error) => {
-                    self.set_last_reply(error, true);
-                    self.running = None;
-                    break;
-                }
-            }
-        }
-        finished
-    }
-
-    fn set_last_reply(&mut self, reply: String, failed: bool) {
-        if let Some(entry) = self.entries.last_mut() {
-            entry.reply = if reply.trim().is_empty() { "Done.".into() } else { reply };
-            entry.failed = failed;
-        }
-    }
-
-    // ---- Side panel ----
-
-    pub fn panel(&mut self, ui: &mut Ui, editor: &Editor) {
-        ui.horizontal(|ui| {
-            ui.heading("Assistant");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Settings").clicked() {
-                    self.open_settings();
-                }
-            });
-        });
-        ui.label(RichText::new(self.model_summary()).small().weak());
-        ui.separator();
-
-        let input_height = 90.0;
-        ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .auto_shrink(false)
-            .max_height(ui.available_height() - input_height)
-            .show(ui, |ui| self.conversation(ui, editor));
-
-        ui.separator();
-        let running = self.is_running();
-        let field = TextEdit::multiline(&mut self.input)
-            .hint_text("Ask for an edit… (Enter to send, Shift+Enter for a new line)")
-            .desired_rows(2)
-            .desired_width(f32::INFINITY)
-            .return_key(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter));
-        let response = ui.add_enabled(!running, field);
-        self.input_has_focus = response.has_focus();
-        let enter = response.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift);
-        let send = ui.add_enabled(!running && !self.input.trim().is_empty(), Button::new("Send"));
-        if enter || send.clicked() {
-            let request = std::mem::take(&mut self.input);
-            self.submit(request, editor, ui.ctx());
-        }
-    }
-
-    fn conversation(&mut self, ui: &mut Ui, editor: &Editor) {
-        if self.entries.is_empty() {
-            ui.label("Tell me what to do with your document. For example:");
-            let mut picked = None;
-            for example in EXAMPLES {
-                if ui.link(format!("“{example}”")).clicked() {
-                    picked = Some(example.to_string());
-                }
-            }
-            ui.add_space(8.0);
-            ui.label(RichText::new("Press Ctrl+K anywhere to ask without the panel.").weak());
-            if let Some(example) = picked {
-                self.submit(example, editor, ui.ctx());
-            }
-            return;
-        }
-        let last = self.entries.len() - 1;
-        for (index, entry) in self.entries.iter().enumerate() {
-            ui.label(RichText::new(&entry.request).strong());
-            if index == last && self.running.is_some() {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label(&self.progress);
-                });
-            } else if entry.failed {
-                ui.label(RichText::new(&entry.reply).color(Color32::from_rgb(220, 90, 80)));
-            } else {
-                ui.label(&entry.reply);
-            }
-            ui.add_space(10.0);
-        }
-        if self.running.is_some() && ui.button("Cancel").clicked() {
-            self.cancel();
-            self.set_last_reply("Cancelled.".into(), true);
-        }
-    }
-
-    fn model_summary(&self) -> String {
-        format!("{} · images: {}", self.config.agent.model, self.config.images.model)
-    }
-
-    // ---- Ctrl+K command bar ----
-
-    pub fn command_bar(&mut self, ctx: &egui::Context, editor: &Editor) {
-        let Some(text) = self.command_bar.as_mut() else { return };
-        let mut submit = false;
-        let mut close = ctx.input(|i| i.key_pressed(Key::Escape));
-        egui::Window::new("Ask the assistant")
-            .title_bar(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_TOP, [0.0, 80.0])
-            .fixed_size([520.0, 0.0])
-            .show(ctx, |ui| {
-                let field = TextEdit::singleline(text)
-                    .hint_text("What should I do? e.g. “make this a numbered list”")
-                    .desired_width(f32::INFINITY);
-                let response = ui.add(field);
-                submit = response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                if !submit {
-                    response.request_focus();
-                }
-                ui.label(RichText::new("Enter to send · Esc to close").small().weak());
-            });
-        if submit {
-            let request = std::mem::take(text);
-            self.submit(request, editor, ctx);
-            close = true;
-        }
-        if close {
-            self.command_bar = None;
-        }
-    }
-
-    // ---- Settings ----
-
-    fn open_settings(&mut self) {
-        self.settings = Some(Settings { draft: self.config.clone(), error: None });
-    }
-
-    pub fn settings_window(&mut self, ctx: &egui::Context) {
-        let Some(settings) = self.settings.as_mut() else { return };
-        let mut open = true;
-        let mut save = false;
-        egui::Window::new("Assistant settings").open(&mut open).collapsible(false).default_width(460.0).show(
-            ctx,
-            |ui| {
-                ui.heading("Writing assistant");
-                agent_settings(ui, &mut settings.draft.agent);
-                ui.add_space(8.0);
-                ui.heading("Pictures");
-                image_settings(ui, &mut settings.draft.images);
-                ui.add_space(8.0);
-                if let Some(path) = Config::path() {
-                    ui.label(
-                        RichText::new(format!(
-                            "Saved to {}. API keys are stored there as plain text.",
-                            path.display()
-                        ))
-                        .small()
-                        .weak(),
-                    );
-                }
-                if let Some(error) = &settings.error {
-                    ui.colored_label(Color32::from_rgb(220, 90, 80), error);
-                }
-                ui.horizontal(|ui| {
-                    save = ui.button("Save").clicked();
-                });
-            },
-        );
-        if save {
-            match settings.draft.save() {
-                Ok(()) => {
-                    self.config = settings.draft.clone();
-                    self.settings = None;
-                }
-                Err(error) => settings.error = Some(error),
-            }
-        } else if !open {
-            self.settings = None;
-        }
-    }
-}
-
-fn agent_settings(ui: &mut Ui, agent: &mut AgentConfig) {
-    let mut provider = agent.provider;
-    let label = |p: AgentProvider| match p {
-        AgentProvider::Anthropic => "Claude (Anthropic)",
-        AgentProvider::OpenaiCompatible => "OpenAI-compatible (OpenAI, Gemini, Ollama, …)",
-    };
-    ComboBox::from_id_salt("agent provider").selected_text(label(provider)).width(300.0).show_ui(ui, |ui| {
-        for option in [AgentProvider::Anthropic, AgentProvider::OpenaiCompatible] {
-            ui.selectable_value(&mut provider, option, label(option));
-        }
-    });
-    if provider != agent.provider {
-        let instructions = std::mem::take(&mut agent.instructions);
-        *agent = AgentConfig { instructions, ..AgentConfig::for_provider(provider) };
-    }
-    egui::Grid::new("agent settings").num_columns(2).show(ui, |ui| {
-        connection_fields(ui, &mut agent.model, &mut agent.api_key, &agent.api_key_env, &mut agent.base_url);
-    });
-    ui.label("Your instructions for the assistant (optional):");
-    ui.add(
-        TextEdit::multiline(&mut agent.instructions)
-            .hint_text("e.g. Write in British English. Keep a friendly tone.")
-            .desired_rows(3)
-            .desired_width(f32::INFINITY),
-    );
-}
-
-fn image_settings(ui: &mut Ui, images: &mut ImageConfig) {
-    let mut provider = images.provider;
-    let label = |p: ImageProvider| match p {
-        ImageProvider::Gemini => "Gemini",
-        ImageProvider::Openai => "OpenAI",
-    };
-    ComboBox::from_id_salt("image provider").selected_text(label(provider)).width(300.0).show_ui(ui, |ui| {
-        for option in [ImageProvider::Gemini, ImageProvider::Openai] {
-            ui.selectable_value(&mut provider, option, label(option));
-        }
-    });
-    if provider != images.provider {
-        *images = ImageConfig::for_provider(provider);
-    }
-    egui::Grid::new("image settings").num_columns(2).show(ui, |ui| {
-        connection_fields(
-            ui,
-            &mut images.model,
-            &mut images.api_key,
-            &images.api_key_env,
-            &mut images.base_url,
-        );
-    });
-}
-
-/// Model, key, and URL fields, shared by both sections.
-fn connection_fields(
-    ui: &mut Ui,
-    model: &mut String,
-    api_key: &mut String,
-    api_key_env: &str,
-    base_url: &mut String,
-) {
-    ui.label("Model");
-    ui.text_edit_singleline(model);
-    ui.end_row();
-    ui.label("API key");
-    ui.add(TextEdit::singleline(api_key).password(true).hint_text(format!("or set ${api_key_env}")));
-    ui.end_row();
-    ui.label("Base URL");
-    ui.text_edit_singleline(base_url);
-    ui.end_row();
 }

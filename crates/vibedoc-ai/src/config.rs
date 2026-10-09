@@ -1,5 +1,5 @@
 //! Which AI services to use. Saved as TOML so people can also edit it by hand:
-//! `~/.config/inkwell/config.toml` on Linux, the platform equivalent elsewhere.
+//! `~/.config/vibedoc/config.toml` on Linux, the platform equivalent elsewhere.
 
 use std::path::PathBuf;
 
@@ -123,7 +123,7 @@ fn resolve_api_key(api_key: &str, env_var: &str) -> Result<String, String> {
 
 impl Config {
     pub fn path() -> Option<PathBuf> {
-        dirs::config_dir().map(|dir| dir.join("inkwell").join("config.toml"))
+        dirs::config_dir().map(|dir| dir.join("vibedoc").join("config.toml"))
     }
 
     /// Loads the saved config, or the defaults if there isn't one yet.
@@ -171,7 +171,7 @@ mod tests {
 
     #[test]
     fn a_key_in_the_config_wins_over_the_environment() {
-        assert_eq!(resolve_api_key(" abc ", "INKWELL_TEST_UNSET_VAR"), Ok("abc".into()));
-        assert!(resolve_api_key("", "INKWELL_TEST_UNSET_VAR").is_err());
+        assert_eq!(resolve_api_key(" abc ", "VIBEDOC_TEST_UNSET_VAR"), Ok("abc".into()));
+        assert!(resolve_api_key("", "VIBEDOC_TEST_UNSET_VAR").is_err());
     }
 }

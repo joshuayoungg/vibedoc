@@ -1,34 +1,36 @@
-//! The pages on screen: painting the layout and turning mouse and keyboard
-//! input into editor commands.
+//! The pages on screen: turning mouse and keyboard input into editor commands.
+//! Painting lives in `paint`, page placement in `geometry`.
+
+mod fonts;
+mod geometry;
+mod paint;
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{
-    self, Color32, ColorImage, CursorIcon, Event, EventFilter, FontId, Key, Modifiers, Painter, Pos2, Rect,
-    Response, ScrollArea, Sense, Stroke, TextureHandle, TextureOptions, Ui, Vec2,
+    self, ColorImage, CursorIcon, Event, EventFilter, Key, Modifiers, Rect, Response, ScrollArea, Sense,
+    TextureHandle, TextureOptions, Ui, Vec2,
 };
-use inkwell_core::layout::Line;
-use inkwell_core::{is_image_char, Document, Editor, Image, Layout, PageSetup, Position};
+use vibedoc_core::{Document, Editor, Image, Layout, PageSetup, Position};
 
-use crate::fonts::{font_size, is_bold, EguiMeasure, FAKE_BOLD_SHIFT};
-
-/// Gap around and between pages, in screen points.
-const PAGE_GAP: f32 = 24.0;
-const TEXT_COLOR: Color32 = Color32::from_rgb(30, 30, 30);
-// See-through, so selected and found images stay visible underneath.
-const SELECTION_COLOR: Color32 = Color32::from_rgba_premultiplied(30, 80, 160, 70);
-const FIND_COLOR: Color32 = Color32::from_rgba_premultiplied(120, 95, 0, 110);
+use fonts::EguiMeasure;
+use geometry::PageGeometry;
+pub use paint::{PageLook, Paper};
 
 pub struct DocumentView {
     pub zoom: f32,
+    /// Keeps each tab's scroll position separate.
+    id: u64,
     /// Layout is rebuilt only when the document's revision changes.
     cached_layout: Option<(u64, Rc<Layout>)>,
     /// Column the caret tries to stay in while pressing Up/Down.
     goal_x: Option<f32>,
     scroll_to_caret: bool,
+    /// A paragraph to bring into view, e.g. one the assistant changed.
+    scroll_to_paragraph: Option<usize>,
     /// Decoded images, uploaded to the GPU once. `None` if the file couldn't be decoded.
     textures: HashMap<ImageKey, Option<TextureHandle>>,
 }
@@ -43,11 +45,14 @@ fn image_key(image: &Image) -> ImageKey {
 
 impl Default for DocumentView {
     fn default() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         DocumentView {
-            zoom: 1.25,
+            zoom: 1.0,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             cached_layout: None,
             goal_x: None,
             scroll_to_caret: false,
+            scroll_to_paragraph: None,
             textures: HashMap::new(),
         }
     }
@@ -56,6 +61,10 @@ impl Default for DocumentView {
 impl DocumentView {
     pub fn reveal_caret(&mut self) {
         self.scroll_to_caret = true;
+    }
+
+    pub fn reveal_paragraph(&mut self, paragraph: usize) {
+        self.scroll_to_paragraph = Some(paragraph);
     }
 
     pub fn layout(&mut self, ctx: &egui::Context, editor: &Editor) -> Rc<Layout> {
@@ -69,13 +78,6 @@ impl DocumentView {
         let layout = Rc::new(layout);
         self.cached_layout = Some((editor.revision(), layout.clone()));
         layout
-    }
-
-    /// Forget the cached layout (e.g. after opening a different file).
-    pub fn reset(&mut self) {
-        self.cached_layout = None;
-        self.goal_x = None;
-        self.textures.clear();
     }
 
     fn load_textures(&mut self, ctx: &egui::Context, document: &Document) {
@@ -93,11 +95,11 @@ impl DocumentView {
         &mut self,
         ui: &mut Ui,
         editor: &mut Editor,
-        highlights: &[(Position, Position)],
+        look: &PageLook,
         keep_focus: bool,
         editable: bool,
     ) {
-        ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+        ScrollArea::both().id_salt(("pages", self.id)).auto_shrink(false).show(ui, |ui| {
             let layout = self.layout(ui.ctx(), editor);
             let pages = PageGeometry::new(ui.cursor().min, ui.available_width(), &layout, self.zoom);
             let response = ui.allocate_rect(pages.total_rect, Sense::click_and_drag());
@@ -105,7 +107,7 @@ impl DocumentView {
             if keep_focus && !response.has_focus() {
                 response.request_focus();
             }
-            self.handle_pointer(ui, &response, editor, &layout, &pages);
+            self.handle_pointer(ui, &response, editor, &layout, &pages, editable);
             if response.has_focus() && editable {
                 self.handle_keyboard(ui, &response, editor, &layout);
             }
@@ -114,15 +116,29 @@ impl DocumentView {
             let layout = self.layout(ui.ctx(), editor);
             let pages = PageGeometry::new(response.rect.min, response.rect.width(), &layout, self.zoom);
             self.load_textures(ui.ctx(), editor.document());
-            paint(ui, editor, &layout, &pages, highlights, &self.textures, response.has_focus());
+            paint::paint(ui, editor, &layout, &pages, look, &self.textures, response.has_focus());
 
             if std::mem::take(&mut self.scroll_to_caret) {
-                let caret = layout.caret(editor.selection().cursor);
-                let top = pages.to_screen(caret.page, caret.x, caret.y);
-                let rect = Rect::from_min_size(top, Vec2::new(1.0, caret.height * self.zoom));
-                ui.scroll_to_rect(rect.expand(48.0), None);
+                self.scroll_to(ui, &layout, &pages, editor.selection().cursor, None);
+            } else if let Some(paragraph) = self.scroll_to_paragraph.take() {
+                let start = editor.document().clamp(Position::new(paragraph, 0));
+                self.scroll_to(ui, &layout, &pages, start, Some(egui::Align::Center));
             }
         });
+    }
+
+    fn scroll_to(
+        &self,
+        ui: &Ui,
+        layout: &Layout,
+        pages: &PageGeometry,
+        position: Position,
+        align: Option<egui::Align>,
+    ) {
+        let caret = layout.caret(position);
+        let top = pages.to_screen(caret.page, caret.x, caret.y);
+        let rect = Rect::from_min_size(top, Vec2::new(1.0, caret.height * self.zoom));
+        ui.scroll_to_rect(rect.expand(48.0), align);
     }
 
     fn handle_pointer(
@@ -132,14 +148,21 @@ impl DocumentView {
         editor: &mut Editor,
         layout: &Layout,
         pages: &PageGeometry,
+        editable: bool,
     ) {
-        if response.hovered() {
-            ui.ctx().set_cursor_icon(CursorIcon::Text);
+        if let Some(hover) = response.hover_pos() {
+            let (page, x, y) = pages.to_layout(hover);
+            let over_checkbox = layout.checkbox_at(page, x, y).is_some();
+            ui.ctx().set_cursor_icon(if over_checkbox { CursorIcon::PointingHand } else { CursorIcon::Text });
         }
         let Some(pointer) = response.interact_pointer_pos() else { return };
         let (page, x, y) = pages.to_layout(pointer);
         let position = layout.position_at(page, x, y);
         let (pressed, shift) = ui.input(|i| (i.pointer.primary_pressed(), i.modifiers.shift));
+        if let (true, true, Some(item)) = (pressed, editable, layout.checkbox_at(page, x, y)) {
+            editor.toggle_checked(item);
+            return;
+        }
 
         if response.double_clicked() {
             editor.select_word_at(position);
@@ -205,203 +228,5 @@ impl DocumentView {
             self.goal_x = None;
         }
         true
-    }
-}
-
-/// Where the pages sit on screen, and converting between screen points and
-/// layout coordinates (points inside a page's content area).
-struct PageGeometry {
-    total_rect: Rect,
-    left: f32,
-    top: f32,
-    zoom: f32,
-    setup: PageSetup,
-}
-
-impl PageGeometry {
-    fn new(origin: Pos2, available_width: f32, layout: &Layout, zoom: f32) -> Self {
-        let setup = layout.page_setup;
-        let page_width = setup.width * zoom;
-        let page_stride = setup.height * zoom + PAGE_GAP;
-        let width = (page_width + 2.0 * PAGE_GAP).max(available_width);
-        let height = PAGE_GAP + layout.page_count as f32 * page_stride;
-        let total_rect = Rect::from_min_size(origin, Vec2::new(width, height));
-        PageGeometry {
-            total_rect,
-            left: total_rect.center().x - page_width / 2.0,
-            top: total_rect.top() + PAGE_GAP,
-            zoom,
-            setup,
-        }
-    }
-
-    fn page_stride(&self) -> f32 {
-        self.setup.height * self.zoom + PAGE_GAP
-    }
-
-    fn page_rect(&self, page: usize) -> Rect {
-        let min = Pos2::new(self.left, self.top + page as f32 * self.page_stride());
-        Rect::from_min_size(min, Vec2::new(self.setup.width, self.setup.height) * self.zoom)
-    }
-
-    fn to_screen(&self, page: usize, x: f32, y: f32) -> Pos2 {
-        let corner = self.page_rect(page).min;
-        corner + Vec2::new(x + self.setup.margin, y + self.setup.margin) * self.zoom
-    }
-
-    fn to_layout(&self, point: Pos2) -> (usize, f32, f32) {
-        let page = ((point.y - self.top) / self.page_stride()).floor().max(0.0) as usize;
-        let corner = self.page_rect(page).min;
-        let x = (point.x - corner.x) / self.zoom - self.setup.margin;
-        let y = (point.y - corner.y) / self.zoom - self.setup.margin;
-        (page, x, y)
-    }
-}
-
-fn paint(
-    ui: &Ui,
-    editor: &Editor,
-    layout: &Layout,
-    pages: &PageGeometry,
-    highlights: &[(Position, Position)],
-    textures: &HashMap<ImageKey, Option<TextureHandle>>,
-    focused: bool,
-) {
-    let painter = ui.painter();
-    let visible = ui.clip_rect();
-
-    for page in 0..layout.page_count {
-        let rect = pages.page_rect(page);
-        if rect.intersects(visible) {
-            painter.rect_filled(rect.translate(Vec2::new(1.0, 2.0)), 0.0, Color32::from_black_alpha(40));
-            painter.rect_filled(rect, 0.0, Color32::WHITE);
-        }
-    }
-
-    let selection = editor.selection();
-    for line in &layout.lines {
-        let top_left = pages.to_screen(line.page, 0.0, line.y);
-        let line_rect = Rect::from_min_size(
-            top_left,
-            Vec2::new(layout.page_setup.content_width(), line.height) * pages.zoom,
-        );
-        if !line_rect.intersects(visible) {
-            continue;
-        }
-        paint_line_images(painter, line, pages, editor.document(), textures);
-        for &(start, end) in highlights {
-            paint_range(painter, line, pages, start, end, FIND_COLOR);
-        }
-        if !selection.is_empty() {
-            paint_range(painter, line, pages, selection.start(), selection.end(), SELECTION_COLOR);
-        }
-        paint_line_text(ui, painter, line, pages);
-    }
-
-    if focused {
-        let caret = layout.caret(selection.cursor);
-        let top = pages.to_screen(caret.page, caret.x, caret.y);
-        let bottom = top + Vec2::new(0.0, caret.height * pages.zoom);
-        painter.line_segment([top, bottom], Stroke::new(1.5, TEXT_COLOR));
-    }
-}
-
-/// Shades the part of `start..end` that falls on this line.
-fn paint_range(
-    painter: &Painter,
-    line: &Line,
-    pages: &PageGeometry,
-    start: Position,
-    end: Position,
-    color: Color32,
-) {
-    if line.paragraph < start.paragraph || line.paragraph > end.paragraph {
-        return;
-    }
-    let from = if line.paragraph == start.paragraph { start.offset.max(line.start) } else { line.start };
-    let to = if line.paragraph == end.paragraph { end.offset.min(line.end) } else { line.end };
-    let mut right = line.x_of(to);
-    // Show the paragraph break as selected when the selection continues past it.
-    if line.last_in_paragraph && line.paragraph < end.paragraph {
-        right += 4.0;
-    }
-    let left = line.x_of(from);
-    if from > to || right <= left {
-        return;
-    }
-    let min = pages.to_screen(line.page, left, line.y);
-    let max = pages.to_screen(line.page, right, line.y + line.height);
-    painter.rect_filled(Rect::from_min_max(min, max), 0.0, color);
-}
-
-/// Images sit on the bottom of their line, like a very tall letter.
-fn paint_line_images(
-    painter: &Painter,
-    line: &Line,
-    pages: &PageGeometry,
-    document: &Document,
-    textures: &HashMap<ImageKey, Option<TextureHandle>>,
-) {
-    for glyph in &line.glyphs {
-        let Some(image) = document.image(glyph.ch) else { continue };
-        let height = image.height * glyph.width / image.width;
-        let top_left = pages.to_screen(line.page, glyph.x, line.y + line.height - height);
-        let rect = Rect::from_min_size(top_left, Vec2::new(glyph.width, height) * pages.zoom);
-        match textures.get(&image_key(image)).and_then(Option::as_ref) {
-            Some(texture) => {
-                let whole = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
-                painter.image(texture.id(), rect, whole, Color32::WHITE);
-            }
-            None => {
-                painter.rect_filled(rect, 4.0, Color32::from_gray(235));
-                painter.text(
-                    rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "image",
-                    FontId::proportional(14.0),
-                    Color32::GRAY,
-                );
-            }
-        }
-    }
-}
-
-fn paint_line_text(ui: &Ui, painter: &Painter, line: &Line, pages: &PageGeometry) {
-    let size = font_size(line.kind) * pages.zoom;
-    let font = FontId::proportional(size);
-    let row_height = ui.ctx().fonts_mut(|f| f.row_height(&font));
-    // Text sits in the bottom `text_height` of the line, below any tall image.
-    let text_top =
-        (line.height - line.text_height) * pages.zoom + (line.text_height * pages.zoom - row_height) / 2.0;
-    let baseline = text_top + row_height * 0.82;
-
-    if let Some(marker) = &line.marker {
-        let x = line.indent - inkwell_core::layout::LIST_INDENT * 0.75;
-        let pos = pages.to_screen(line.page, x, line.y) + Vec2::new(0.0, text_top);
-        painter.text(pos, egui::Align2::LEFT_TOP, marker, font.clone(), TEXT_COLOR);
-    }
-
-    for glyph in &line.glyphs {
-        let pos = pages.to_screen(line.page, glyph.x, line.y) + Vec2::new(0.0, text_top);
-        if !glyph.ch.is_whitespace() && !is_image_char(glyph.ch) {
-            let format = TextFormat {
-                font_id: font.clone(),
-                color: TEXT_COLOR,
-                italics: glyph.style.italic,
-                ..Default::default()
-            };
-            let job = LayoutJob::single_section(glyph.ch.to_string(), format);
-            let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
-            if is_bold(glyph.style, line.kind) {
-                let shift = Vec2::new(size * FAKE_BOLD_SHIFT, 0.0);
-                painter.galley(pos + shift, galley.clone(), TEXT_COLOR);
-            }
-            painter.galley(pos, galley, TEXT_COLOR);
-        }
-        if glyph.style.underline {
-            let y = pos.y - text_top + baseline;
-            let end = pos.x + glyph.width * pages.zoom;
-            painter.line_segment([Pos2::new(pos.x, y), Pos2::new(end, y)], Stroke::new(1.0, TEXT_COLOR));
-        }
     }
 }

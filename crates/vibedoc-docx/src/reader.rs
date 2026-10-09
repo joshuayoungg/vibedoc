@@ -1,12 +1,16 @@
-//! Reads a .docx into a document. Anything Inkwell doesn't support yet
-//! (tables, fonts, colors) is skipped, keeping its text where possible.
+//! Reads a .docx into a document. Anything VibeDoc doesn't support yet
+//! (tables, page setup) is skipped, keeping its text where possible. Fonts
+//! become the closest bundled font.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use inkwell_core::{Document, Image, PageSetup, Paragraph, ParagraphKind, StyledChar, TextStyle};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
+use vibedoc_core::{
+    Alignment, Color, Document, Font, Image, LineSpacing, PageSetup, Paragraph, ParagraphKind, Script,
+    StyledChar, TextStyle,
+};
 use zip::ZipArchive;
 
 use crate::Error;
@@ -179,6 +183,24 @@ impl ParserState {
                 }
             }
             "w:numPr" if self.in_paragraph_properties => self.is_list = true,
+            "w:jc" if self.in_paragraph_properties => {
+                let alignment = match attribute(tag, "w:val").as_deref() {
+                    Some("center") => Alignment::Center,
+                    Some("right" | "end") => Alignment::Right,
+                    Some("both" | "distribute") => Alignment::Justify,
+                    _ => Alignment::Left,
+                };
+                if let Some(paragraph) = self.paragraph.as_mut() {
+                    paragraph.alignment = alignment;
+                }
+            }
+            "w:spacing" if self.in_paragraph_properties => {
+                let auto = attribute(tag, "w:lineRule").is_none_or(|rule| rule == "auto");
+                let line = attribute(tag, "w:line").and_then(|v| v.parse::<f32>().ok());
+                if let (true, Some(line), Some(paragraph)) = (auto, line, self.paragraph.as_mut()) {
+                    paragraph.spacing = LineSpacing::closest_to(line / 240.0);
+                }
+            }
             "w:numId" if self.in_paragraph_properties => self.list_id = attribute(tag, "w:val"),
             "w:r" => self.run_style = TextStyle::default(),
             "w:rPr" if in_run => self.in_run_properties = !is_empty,
@@ -186,6 +208,31 @@ impl ParserState {
             "w:i" if self.in_run_properties => self.run_style.italic = is_on(tag),
             "w:u" if self.in_run_properties => {
                 self.run_style.underline = attribute(tag, "w:val").as_deref() != Some("none") && is_on(tag)
+            }
+            "w:strike" if self.in_run_properties => self.run_style.strikethrough = is_on(tag),
+            "w:rFonts" if self.in_run_properties => {
+                if let Some(name) = attribute(tag, "w:ascii").or_else(|| attribute(tag, "w:hAnsi")) {
+                    self.run_style.font = Font::closest_to(&name);
+                }
+            }
+            "w:sz" if self.in_run_properties => {
+                self.run_style.size = attribute(tag, "w:val").and_then(|v| v.parse().ok());
+            }
+            "w:color" if self.in_run_properties => {
+                self.run_style.color = attribute(tag, "w:val").and_then(|v| Color::from_hex(&v));
+            }
+            "w:highlight" if self.in_run_properties => {
+                self.run_style.highlight = attribute(tag, "w:val").and_then(|v| highlight_color(&v));
+            }
+            "w:shd" if self.in_run_properties => {
+                self.run_style.highlight = attribute(tag, "w:fill").and_then(|v| Color::from_hex(&v));
+            }
+            "w:vertAlign" if self.in_run_properties => {
+                self.run_style.script = match attribute(tag, "w:val").as_deref() {
+                    Some("superscript") => Script::Superscript,
+                    Some("subscript") => Script::Subscript,
+                    _ => Script::Normal,
+                };
             }
             "w:t" => self.in_text = !is_empty,
             "w:tab" if in_run => self.push_text("\t"),
@@ -222,6 +269,14 @@ impl ParserState {
             let is_bullet = list_id.and_then(|id| bullet_lists.get(&id).copied()).unwrap_or(true);
             paragraph.kind = if is_bullet { ParagraphKind::Bullet } else { ParagraphKind::Numbered };
         }
+        // Checklists are saved as a box character in front of the text.
+        let checkbox = paragraph.chars.first().map(|c| c.ch).filter(|ch| matches!(ch, '☐' | '☒' | '☑'));
+        if let Some(checkbox) = checkbox {
+            let prefix = if paragraph.chars.get(1).is_some_and(|c| c.ch == ' ') { 2 } else { 1 };
+            paragraph.chars.drain(..prefix);
+            paragraph.kind = ParagraphKind::Checklist;
+            paragraph.checked = checkbox != '☐';
+        }
         self.in_paragraph_properties = false;
         paragraph
     }
@@ -235,9 +290,36 @@ fn kind_for_style(style_id: &str) -> Option<ParagraphKind> {
         "subtitle" | "heading2" => Some(ParagraphKind::Heading2),
         _ if id.starts_with("listbullet") => Some(ParagraphKind::Bullet),
         _ if id.starts_with("listnumber") => Some(ParagraphKind::Numbered),
+        "quote" | "intensequote" | "blocktext" => Some(ParagraphKind::Quote),
+        "code" | "sourcecode" | "htmlpreformatted" | "plaintext" => Some(ParagraphKind::Code),
+        "checklist" => Some(ParagraphKind::Checklist),
         _ if id.starts_with("heading") => Some(ParagraphKind::Heading3),
         _ => None,
     }
+}
+
+/// Word's named highlight colors.
+fn highlight_color(name: &str) -> Option<Color> {
+    let hex = match name {
+        "yellow" => "FFFF00",
+        "green" => "00FF00",
+        "cyan" => "00FFFF",
+        "magenta" => "FF00FF",
+        "blue" => "0000FF",
+        "red" => "FF0000",
+        "darkBlue" => "000080",
+        "darkCyan" => "008080",
+        "darkGreen" => "008000",
+        "darkMagenta" => "800080",
+        "darkRed" => "800000",
+        "darkYellow" => "808000",
+        "darkGray" => "808080",
+        "lightGray" => "C0C0C0",
+        "black" => "000000",
+        "white" => "FFFFFF",
+        _ => return None,
+    };
+    Color::from_hex(hex)
 }
 
 /// `<w:b/>` means bold, but `<w:b w:val="0"/>` means explicitly not bold.

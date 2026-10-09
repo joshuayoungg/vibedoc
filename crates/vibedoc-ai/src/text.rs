@@ -3,7 +3,7 @@
 //! Both directions use a tiny Markdown subset: `**bold**`, `*italic*`, and
 //! `__underline__`. Models already write this naturally.
 
-use inkwell_core::{is_image_char, Document, ParagraphKind, Selection, StyledChar, TextStyle};
+use vibedoc_core::{is_image_char, Document, ParagraphKind, Selection, StyledChar, TextStyle};
 
 /// The document as numbered lines, e.g. `[2] - a **bold** bullet`.
 pub fn describe_document(document: &Document) -> String {
@@ -16,6 +16,10 @@ pub fn describe_document(document: &Document) -> String {
             ParagraphKind::Heading3 => "### ",
             ParagraphKind::Bullet => "- ",
             ParagraphKind::Numbered => "1. ",
+            ParagraphKind::Quote => "> ",
+            ParagraphKind::Code => "``` ",
+            ParagraphKind::Checklist if paragraph.checked => "- [x] ",
+            ParagraphKind::Checklist => "- [ ] ",
         };
         let content = to_markdown(&paragraph.chars);
         let content = if content.is_empty() { "(empty)".to_string() } else { content };
@@ -99,7 +103,7 @@ pub fn parse_markdown(text: &str) -> Vec<StyledChar> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use inkwell_core::{Paragraph, Position};
+    use vibedoc_core::{Paragraph, Position};
 
     #[test]
     fn markdown_round_trips() {
@@ -116,7 +120,7 @@ mod tests {
             Paragraph::new(ParagraphKind::Normal),
             Paragraph::from_text(ParagraphKind::Bullet, "item", TextStyle::default()),
         ]);
-        let image = inkwell_core::Image::fitted(vec![], 10.0, 10.0, 10.0, 10.0);
+        let image = vibedoc_core::Image::fitted(vec![], 10.0, 10.0, 10.0, 10.0);
         document.insert_image(Position::new(1, 0), image);
         assert_eq!(describe_document(&document), "[0] # Title\n[1] [image]\n[2] - item\n");
     }

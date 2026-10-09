@@ -2,11 +2,11 @@
 
 use std::sync::Mutex;
 
-use inkwell_ai::agent::run_with;
-use inkwell_ai::models::{ChatModel, ImageModel, Message, Reply, ToolCall, ToolSpec};
-use inkwell_ai::tools::Workspace;
-use inkwell_core::{is_image_char, Document, Paragraph, ParagraphKind, Position, Selection, TextStyle};
 use serde_json::{json, Value};
+use vibedoc_ai::agent::run_with;
+use vibedoc_ai::models::{ChatModel, ImageModel, Message, Reply, ToolCall, ToolSpec};
+use vibedoc_ai::tools::Workspace;
+use vibedoc_core::{is_image_char, Document, Paragraph, ParagraphKind, Position, Selection, TextStyle};
 
 /// Replies with each scripted batch of tool calls in turn, then "Done."
 struct ScriptedModel {

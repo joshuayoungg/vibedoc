@@ -6,7 +6,7 @@
 
 use std::sync::mpsc::{channel, Receiver};
 
-use inkwell_core::{Document, Selection};
+use vibedoc_core::{Document, Selection};
 
 use crate::config::Config;
 use crate::models::{chat_model, image_model, ChatModel, Message, ToolResult};
@@ -17,14 +17,14 @@ use crate::tools::{tool_specs, Workspace};
 const MAX_STEPS: usize = 16;
 
 const SYSTEM_PROMPT: &str = "\
-You are the assistant built into Inkwell, a word processor. The user asks you to write, edit, \
+You are the assistant built into VibeDoc, a word processor. The user asks you to write, edit, \
 format, or illustrate their document.
 
 - Change the document only by calling tools. Never say you changed something you didn't.
 - Paragraphs are numbered from 0, shown in [brackets]. Inserting or deleting shifts the numbers \
 of later paragraphs; call read_document if you're unsure.
 - Inline formatting appears, and can be written, as **bold**, *italic*, and __underline__. \
-Prefixes like `# `, `- `, and `1. ` show the paragraph kind; set kinds with the `kind` field, \
+Prefixes like `# `, `- `, `1. `, `> ` (quote), ``` (code), and `- [ ] ` (checklist) show the paragraph kind; set kinds with the `kind` field, \
 not by typing these prefixes.
 - \"This\", \"it\", and \"here\" usually mean the user's selection, or the paragraph with the caret.
 - For pictures, write a detailed prompt (subject, style, composition) for insert_image.

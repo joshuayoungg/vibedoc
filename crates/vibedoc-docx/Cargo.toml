@@ -1,10 +1,10 @@
 [package]
-name = "inkwell-docx"
+name = "vibedoc-docx"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-inkwell-core = { version = "0.1.0", path = "../inkwell-core" }
+vibedoc-core = { version = "0.1.0", path = "../vibedoc-core" }
 quick-xml = "0.42.0"
 zip = "8.6.0"

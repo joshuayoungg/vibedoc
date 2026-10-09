@@ -6,11 +6,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// How a run of text looks. Every character carries one of these.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextStyle {
     pub bold: bool,
     pub italic: bool,
     pub underline: bool,
+    pub strikethrough: bool,
+    pub script: Script,
+    pub font: Font,
+    /// Size in half-points, like Word. `None` uses the paragraph kind's size.
+    pub size: Option<u16>,
+    /// `None` is automatic: dark on light pages, light on dark ones.
+    pub color: Option<Color>,
+    pub highlight: Option<Color>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,6 +27,7 @@ pub enum StyleFlag {
     Bold,
     Italic,
     Underline,
+    Strikethrough,
 }
 
 impl TextStyle {
@@ -26,6 +36,7 @@ impl TextStyle {
             StyleFlag::Bold => self.bold,
             StyleFlag::Italic => self.italic,
             StyleFlag::Underline => self.underline,
+            StyleFlag::Strikethrough => self.strikethrough,
         }
     }
 
@@ -34,7 +45,128 @@ impl TextStyle {
             StyleFlag::Bold => self.bold = value,
             StyleFlag::Italic => self.italic = value,
             StyleFlag::Underline => self.underline = value,
+            StyleFlag::Strikethrough => self.strikethrough = value,
         }
+    }
+
+    /// The size in points, falling back to the paragraph kind's size.
+    pub fn points(self, kind: ParagraphKind) -> f32 {
+        self.size.map_or(kind.font_size(), |half_points| f32::from(half_points) / 2.0)
+    }
+
+    /// The typeface and weight text is drawn in. Code is always monospaced,
+    /// and headings are always bold.
+    pub fn face(self, kind: ParagraphKind) -> (Font, bool) {
+        let font = if kind == ParagraphKind::Code { Font::JetBrainsMono } else { self.font };
+        (font, self.bold || kind.is_heading())
+    }
+
+    /// The size glyphs are drawn at: smaller for raised and lowered text.
+    pub fn glyph_points(self, kind: ParagraphKind) -> f32 {
+        const SCRIPT_SCALE: f32 = 0.65;
+        let scale = if self.script == Script::Normal { 1.0 } else { SCRIPT_SCALE };
+        self.points(kind) * scale
+    }
+
+    /// How far the baseline is raised for superscript (negative: lowered for subscript), in points.
+    pub fn rise(self, kind: ParagraphKind) -> f32 {
+        let size = self.points(kind);
+        match self.script {
+            Script::Normal => 0.0,
+            Script::Superscript => size * 0.35,
+            Script::Subscript => -size * 0.12,
+        }
+    }
+}
+
+/// Raised or lowered text, like x² or H₂O.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Script {
+    #[default]
+    Normal,
+    Superscript,
+    Subscript,
+}
+
+/// The typefaces VibeDoc ships with, so documents look the same everywhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Font {
+    #[default]
+    Inter,
+    Poppins,
+    Lora,
+    Merriweather,
+    PlayfairDisplay,
+    JetBrainsMono,
+}
+
+impl Font {
+    pub const ALL: [Font; 6] = [
+        Font::Inter,
+        Font::Poppins,
+        Font::Lora,
+        Font::Merriweather,
+        Font::PlayfairDisplay,
+        Font::JetBrainsMono,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Font::Inter => "Inter",
+            Font::Poppins => "Poppins",
+            Font::Lora => "Lora",
+            Font::Merriweather => "Merriweather",
+            Font::PlayfairDisplay => "Playfair Display",
+            Font::JetBrainsMono => "JetBrains Mono",
+        }
+    }
+
+    /// The closest bundled font for a font name found in a .docx file.
+    pub fn closest_to(name: &str) -> Font {
+        let name = name.to_lowercase();
+        if let Some(font) = Font::ALL.into_iter().find(|f| f.name().to_lowercase() == name) {
+            return font;
+        }
+        let any = |words: &[&str]| words.iter().any(|w| name.contains(w));
+        if any(&["mono", "courier", "consolas", "menlo", "monaco", "code"]) {
+            Font::JetBrainsMono
+        } else if any(&["playfair", "didot", "bodoni"]) {
+            Font::PlayfairDisplay
+        } else if any(&["times", "georgia", "cambria", "garamond", "palatino", "book", "serif", "minion"]) {
+            Font::Merriweather
+        } else if any(&["poppins", "futura", "century gothic", "avenir", "montserrat"]) {
+            Font::Poppins
+        } else {
+            Font::Inter
+        }
+    }
+}
+
+/// A color as red, green, and blue bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Color {
+    pub const fn rgb(r: u8, g: u8, b: u8) -> Color {
+        Color { r, g, b }
+    }
+
+    /// "1F2937", as Word writes colors.
+    pub fn hex(self) -> String {
+        format!("{:02X}{:02X}{:02X}", self.r, self.g, self.b)
+    }
+
+    pub fn from_hex(hex: &str) -> Option<Color> {
+        let hex = hex.trim_start_matches('#');
+        if hex.len() != 6 {
+            return None;
+        }
+        let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+        Some(Color { r: byte(0)?, g: byte(2)?, b: byte(4)? })
     }
 }
 
@@ -45,18 +177,24 @@ pub enum ParagraphKind {
     Heading1,
     Heading2,
     Heading3,
+    Quote,
+    Code,
     Bullet,
     Numbered,
+    Checklist,
 }
 
 impl ParagraphKind {
-    pub const ALL: [ParagraphKind; 6] = [
+    pub const ALL: [ParagraphKind; 9] = [
         ParagraphKind::Normal,
         ParagraphKind::Heading1,
         ParagraphKind::Heading2,
         ParagraphKind::Heading3,
+        ParagraphKind::Quote,
+        ParagraphKind::Code,
         ParagraphKind::Bullet,
         ParagraphKind::Numbered,
+        ParagraphKind::Checklist,
     ];
 
     pub fn label(self) -> &'static str {
@@ -65,17 +203,82 @@ impl ParagraphKind {
             ParagraphKind::Heading1 => "Heading 1",
             ParagraphKind::Heading2 => "Heading 2",
             ParagraphKind::Heading3 => "Heading 3",
+            ParagraphKind::Quote => "Quote",
+            ParagraphKind::Code => "Code",
             ParagraphKind::Bullet => "Bulleted list",
             ParagraphKind::Numbered => "Numbered list",
+            ParagraphKind::Checklist => "Checklist",
         }
     }
 
+    /// Lists continue when you press Enter, and leave the list on an empty item.
     pub fn is_list(self) -> bool {
-        matches!(self, ParagraphKind::Bullet | ParagraphKind::Numbered)
+        matches!(self, ParagraphKind::Bullet | ParagraphKind::Numbered | ParagraphKind::Checklist)
     }
 
     pub fn is_heading(self) -> bool {
         matches!(self, ParagraphKind::Heading1 | ParagraphKind::Heading2 | ParagraphKind::Heading3)
+    }
+
+    /// Text size in points when a character doesn't set its own.
+    pub fn font_size(self) -> f32 {
+        match self {
+            ParagraphKind::Heading1 => 22.0,
+            ParagraphKind::Heading2 => 17.0,
+            ParagraphKind::Heading3 => 14.0,
+            ParagraphKind::Code => 11.0,
+            _ => 12.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Alignment {
+    #[default]
+    Left,
+    Center,
+    Right,
+    Justify,
+}
+
+/// Space between lines, as a multiple of single spacing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LineSpacing {
+    #[default]
+    Single,
+    Relaxed,
+    OneAndHalf,
+    Double,
+}
+
+impl LineSpacing {
+    pub const ALL: [LineSpacing; 4] =
+        [LineSpacing::Single, LineSpacing::Relaxed, LineSpacing::OneAndHalf, LineSpacing::Double];
+
+    pub fn factor(self) -> f32 {
+        match self {
+            LineSpacing::Single => 1.0,
+            LineSpacing::Relaxed => 1.15,
+            LineSpacing::OneAndHalf => 1.5,
+            LineSpacing::Double => 2.0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LineSpacing::Single => "1.0",
+            LineSpacing::Relaxed => "1.15",
+            LineSpacing::OneAndHalf => "1.5",
+            LineSpacing::Double => "2.0",
+        }
+    }
+
+    /// The closest choice to a factor, e.g. from a .docx file.
+    pub fn closest_to(factor: f32) -> LineSpacing {
+        LineSpacing::ALL
+            .into_iter()
+            .min_by(|a, b| (a.factor() - factor).abs().total_cmp(&(b.factor() - factor).abs()))
+            .unwrap_or_default()
     }
 }
 
@@ -89,20 +292,29 @@ pub struct StyledChar {
 pub struct Paragraph {
     pub kind: ParagraphKind,
     pub chars: Vec<StyledChar>,
+    pub alignment: Alignment,
+    pub spacing: LineSpacing,
+    /// Whether a checklist item is ticked.
+    pub checked: bool,
 }
 
 impl Paragraph {
     pub fn new(kind: ParagraphKind) -> Self {
-        Paragraph { kind, chars: Vec::new() }
+        Paragraph { kind, ..Default::default() }
     }
 
     pub fn from_text(kind: ParagraphKind, text: &str, style: TextStyle) -> Self {
         let chars = text.chars().map(|ch| StyledChar { ch, style }).collect();
-        Paragraph { kind, chars }
+        Paragraph { kind, chars, ..Default::default() }
     }
 
     pub fn len(&self) -> usize {
         self.chars.len()
+    }
+
+    /// The paragraph's formatting with no text.
+    fn clone_format(&self) -> Paragraph {
+        Paragraph { chars: Vec::new(), ..*self }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -272,9 +484,11 @@ impl Document {
     pub fn split_paragraph(&mut self, at: Position) -> Position {
         let paragraph = &mut self.paragraphs[at.paragraph];
         let tail = paragraph.chars.split_off(at.offset);
-        // Like Word: a heading is followed by normal text, but lists continue.
+        // Like Word: a heading is followed by normal text, but lists continue
+        // (unticked) and the alignment and spacing carry over.
         let kind = if paragraph.kind.is_heading() { ParagraphKind::Normal } else { paragraph.kind };
-        self.paragraphs.insert(at.paragraph + 1, Paragraph { kind, chars: tail });
+        let next = Paragraph { kind, chars: tail, checked: false, ..paragraph.clone_format() };
+        self.paragraphs.insert(at.paragraph + 1, next);
         Position::new(at.paragraph + 1, 0)
     }
 

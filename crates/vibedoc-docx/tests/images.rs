@@ -1,6 +1,6 @@
 use std::io::Cursor;
 
-use inkwell_core::{Document, Image, Paragraph, ParagraphKind, Position, TextStyle};
+use vibedoc_core::{Document, Image, Paragraph, ParagraphKind, Position, TextStyle};
 
 #[test]
 fn images_survive_saving_and_opening() {
@@ -13,9 +13,9 @@ fn images_survive_saving_and_opening() {
     original.insert_image(Position::new(0, 7), Image::fitted(png_bytes, 200.0, 100.0, 468.0, 648.0));
 
     let mut bytes = Cursor::new(Vec::new());
-    inkwell_docx::write_to(&original, &mut bytes).unwrap();
+    vibedoc_docx::write_to(&original, &mut bytes).unwrap();
     bytes.set_position(0);
-    let reopened = inkwell_docx::read_from(bytes).unwrap();
+    let reopened = vibedoc_docx::read_from(bytes).unwrap();
 
     assert_eq!(reopened, original);
 }

@@ -5,14 +5,22 @@
 //! paint. Text measuring is left to the caller through the [`Measure`] trait,
 //! which keeps this module free of any GUI code and easy to test.
 
-use crate::document::{Document, ParagraphKind, Position, TextStyle};
+use crate::document::{Alignment, Document, Paragraph, ParagraphKind, Position, TextStyle};
 
-/// How wide list content is pushed in to make room for the bullet or number.
+/// How wide list content is pushed in to make room for the bullet, number, or checkbox.
 pub const LIST_INDENT: f32 = 24.0;
+/// Quotes sit to the right of a bar; code sits inside a shaded box.
+pub const QUOTE_INDENT: f32 = 18.0;
+pub const CODE_INDENT: f32 = 10.0;
 
 pub trait Measure {
     fn char_width(&self, ch: char, style: TextStyle, kind: ParagraphKind) -> f32;
-    fn line_height(&self, kind: ParagraphKind) -> f32;
+    /// Height of a line of text in this style, with single spacing.
+    fn line_height(&self, style: TextStyle, kind: ParagraphKind) -> f32;
+    /// How much of `line_height` is below the baseline.
+    fn descent(&self, style: TextStyle, kind: ParagraphKind) -> f32 {
+        self.line_height(style, kind) * 0.25
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -49,14 +57,18 @@ pub struct Line {
     pub y: f32,
     /// Full height, including any image taller than the text.
     pub height: f32,
-    /// Height of one line of text; text sits at the bottom of the line.
+    /// Height of the text part, including line spacing; text sits at the bottom of the line.
     pub text_height: f32,
+    /// Distance from the top of the line down to the text's baseline.
+    pub baseline: f32,
     pub paragraph: usize,
     pub kind: ParagraphKind,
     /// Character offsets in the paragraph covered by this line (`end` is exclusive).
     pub start: usize,
     pub end: usize,
     pub indent: f32,
+    /// Where an empty line's caret goes, so centered empty lines put it in the middle.
+    pub empty_x: f32,
     pub glyphs: Vec<Glyph>,
     /// "•" or "3." on the first line of a list item.
     pub marker: Option<String>,
@@ -70,7 +82,7 @@ impl Line {
         match (self.glyphs.get(index), self.glyphs.last()) {
             (Some(glyph), _) => glyph.x,
             (None, Some(last)) => last.x + last.width,
-            (None, None) => self.indent,
+            (None, None) => self.empty_x,
         }
     }
 
@@ -120,8 +132,7 @@ impl Layout {
         for (index, paragraph) in document.paragraphs.iter().enumerate() {
             let kind = paragraph.kind;
             list_number = if kind == ParagraphKind::Numbered { list_number + 1 } else { 0 };
-            let indent = if kind.is_list() { LIST_INDENT } else { 0.0 };
-            let text_height = measure.line_height(kind);
+            let indent = indent_of(kind);
             let max_width = page_setup.content_width() - indent;
             let widths: Vec<f32> = paragraph
                 .chars
@@ -136,6 +147,8 @@ impl Layout {
             let line_count = ranges.len();
 
             for (line_index, (start, end)) in ranges.into_iter().enumerate() {
+                let last_in_paragraph = line_index + 1 == line_count;
+                let (text_height, descent) = text_metrics(paragraph, start, end, measure);
                 let tallest_image = chars[start..end]
                     .iter()
                     .filter_map(|&ch| document.image(ch))
@@ -147,7 +160,7 @@ impl Layout {
                     y = 0.0;
                 }
                 let mut x = indent;
-                let glyphs = paragraph.chars[start..end]
+                let mut glyphs: Vec<Glyph> = paragraph.chars[start..end]
                     .iter()
                     .zip(&widths[start..end])
                     .map(|(c, &width)| {
@@ -156,6 +169,8 @@ impl Layout {
                         glyph
                     })
                     .collect();
+                let justify = paragraph.alignment == Alignment::Justify && !last_in_paragraph;
+                let empty_x = align(&mut glyphs, paragraph.alignment, justify, indent, max_width);
                 let marker = match (line_index, kind) {
                     (0, ParagraphKind::Bullet) => Some("•".to_string()),
                     (0, ParagraphKind::Numbered) => Some(format!("{list_number}.")),
@@ -166,18 +181,21 @@ impl Layout {
                     y,
                     height,
                     text_height,
+                    baseline: height - descent,
                     paragraph: index,
                     kind,
                     start,
                     end,
                     indent,
+                    empty_x,
                     glyphs,
                     marker,
-                    last_in_paragraph: line_index + 1 == line_count,
+                    last_in_paragraph,
                 });
                 y += height;
             }
-            y += paragraph_spacing(kind, text_height);
+            let next_kind = document.paragraphs.get(index + 1).map(|p| p.kind);
+            y += paragraph_spacing(kind, next_kind, measure.line_height(TextStyle::default(), kind));
         }
 
         Layout { page_setup, lines, page_count: page + 1 }
@@ -237,10 +255,73 @@ impl Layout {
         let line = &self.lines[self.line_index_of(position)];
         Position::new(line.paragraph, line.visual_end())
     }
+
+    /// The checklist item whose checkbox is at this point, if any.
+    pub fn checkbox_at(&self, page: usize, x: f32, y: f32) -> Option<usize> {
+        let line = self.lines.iter().find(|l| l.page == page && y >= l.y && y < l.y + l.height)?;
+        let in_box = x >= line.indent - LIST_INDENT && x < line.indent - 4.0;
+        (line.kind == ParagraphKind::Checklist && line.start == 0 && in_box).then_some(line.paragraph)
+    }
 }
 
-fn paragraph_spacing(kind: ParagraphKind, line_height: f32) -> f32 {
-    if kind.is_list() {
+fn indent_of(kind: ParagraphKind) -> f32 {
+    match kind {
+        _ if kind.is_list() => LIST_INDENT,
+        ParagraphKind::Quote => QUOTE_INDENT,
+        ParagraphKind::Code => CODE_INDENT,
+        _ => 0.0,
+    }
+}
+
+/// The height of a line of text (with line spacing) and how much of it is
+/// below the baseline. Mixed sizes share one baseline, like in Word.
+fn text_metrics(paragraph: &Paragraph, start: usize, end: usize, measure: &impl Measure) -> (f32, f32) {
+    let kind = paragraph.kind;
+    let styles: Vec<TextStyle> = if start == end {
+        // An empty line is as tall as the text that would be typed there.
+        vec![paragraph.chars.get(start.saturating_sub(1)).map(|c| c.style).unwrap_or_default()]
+    } else {
+        paragraph.chars[start..end].iter().map(|c| c.style).collect()
+    };
+    let mut above: f32 = 0.0;
+    let mut below: f32 = 0.0;
+    for style in styles {
+        let descent = measure.descent(style, kind);
+        above = above.max(measure.line_height(style, kind) - descent);
+        below = below.max(descent);
+    }
+    // Extra spacing goes above the text, keeping the baseline near the bottom.
+    ((above + below) * paragraph.spacing.factor(), below)
+}
+
+/// Moves a line's glyphs for its alignment. Justified lines stretch their
+/// spaces to fill the line. Returns where the caret sits if the line is empty.
+fn align(glyphs: &mut [Glyph], alignment: Alignment, justify: bool, indent: f32, max_width: f32) -> f32 {
+    // Trailing spaces hang past the edge, so they don't count.
+    let visible = glyphs.iter().rposition(|g| g.ch != ' ').map_or(0, |i| i + 1);
+    let used = glyphs[..visible].iter().map(|g| g.width).sum::<f32>();
+    let free = (max_width - used).max(0.0);
+    let offset = match alignment {
+        Alignment::Center => free / 2.0,
+        Alignment::Right => free,
+        Alignment::Left | Alignment::Justify => 0.0,
+    };
+    let spaces = glyphs[..visible].iter().filter(|g| g.ch == ' ').count();
+    let stretch = if justify && spaces > 0 { free / spaces as f32 } else { 0.0 };
+    let mut x = indent + offset;
+    for (i, glyph) in glyphs.iter_mut().enumerate() {
+        glyph.x = x;
+        if glyph.ch == ' ' && i < visible {
+            glyph.width += stretch;
+        }
+        x += glyph.width;
+    }
+    indent + offset
+}
+
+fn paragraph_spacing(kind: ParagraphKind, next: Option<ParagraphKind>, line_height: f32) -> f32 {
+    // List items and lines of code stay close together.
+    if kind.is_list() || (kind == ParagraphKind::Code && next == Some(ParagraphKind::Code)) {
         line_height * 0.15
     } else {
         line_height * 0.5
@@ -295,7 +376,7 @@ mod tests {
         fn char_width(&self, _: char, _: TextStyle, _: ParagraphKind) -> f32 {
             10.0
         }
-        fn line_height(&self, _: ParagraphKind) -> f32 {
+        fn line_height(&self, _: TextStyle, _: ParagraphKind) -> f32 {
             20.0
         }
     }
@@ -378,6 +459,47 @@ mod tests {
         assert_eq!(line.height, 50.0);
         assert_eq!(line.text_height, 20.0);
         assert_eq!(line.x_of(2), 40.0);
+    }
+
+    fn layout_paragraph(paragraph: Paragraph) -> Layout {
+        Layout::build(&Document::from_paragraphs(vec![paragraph]), SMALL_PAGE, &FixedMeasure)
+    }
+
+    #[test]
+    fn centered_and_right_aligned_lines_move_over() {
+        let mut p = Paragraph::from_text(ParagraphKind::Normal, "abcd", TextStyle::default());
+        p.alignment = Alignment::Center;
+        assert_eq!(layout_paragraph(p.clone()).lines[0].glyphs[0].x, 30.0);
+        p.alignment = Alignment::Right;
+        assert_eq!(layout_paragraph(p).lines[0].glyphs[0].x, 60.0);
+    }
+
+    #[test]
+    fn justified_lines_fill_the_width_except_the_last() {
+        let mut p = Paragraph::from_text(ParagraphKind::Normal, "ab cd efgh ij", TextStyle::default());
+        p.alignment = Alignment::Justify;
+        let l = layout_paragraph(p);
+        let first = &l.lines[0];
+        let last_glyph = first.glyphs.iter().rfind(|g| g.ch != ' ').unwrap();
+        assert_eq!(last_glyph.x + last_glyph.width, 100.0);
+        assert_eq!(l.lines[1].glyphs[0].x, 0.0);
+    }
+
+    #[test]
+    fn line_spacing_makes_lines_taller() {
+        let mut p = Paragraph::from_text(ParagraphKind::Normal, "a", TextStyle::default());
+        p.spacing = crate::document::LineSpacing::Double;
+        let line = &layout_paragraph(p).lines[0];
+        assert_eq!(line.height, 40.0);
+        assert_eq!(line.baseline, 35.0);
+    }
+
+    #[test]
+    fn clicking_a_checkbox_finds_its_item() {
+        let p = Paragraph::from_text(ParagraphKind::Checklist, "task", TextStyle::default());
+        let l = layout_paragraph(p);
+        assert_eq!(l.checkbox_at(0, 8.0, 5.0), Some(0));
+        assert_eq!(l.checkbox_at(0, 30.0, 5.0), None);
     }
 
     #[test]

@@ -1,17 +1,21 @@
 [package]
-name = "inkwell-app"
+name = "vibedoc-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "inkwell"
+name = "vibedoc"
 path = "src/main.rs"
 
 [dependencies]
+dirs = "7.0.0"
 eframe = "0.36.2"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
-inkwell-ai = { version = "0.1.0", path = "../inkwell-ai" }
-inkwell-core = { version = "0.1.0", path = "../inkwell-core" }
-inkwell-docx = { version = "0.1.0", path = "../inkwell-docx" }
+vibedoc-ai = { version = "0.1.0", path = "../vibedoc-ai" }
+vibedoc-core = { version = "0.1.0", path = "../vibedoc-core" }
+vibedoc-docx = { version = "0.1.0", path = "../vibedoc-docx" }
+vibedoc-pdf = { version = "0.1.0", path = "../vibedoc-pdf" }
 rfd = "0.17.2"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.7"

@@ -10,7 +10,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
-use inkwell_core::Document;
+use vibedoc_core::Document;
 
 pub use reader::read_from;
 pub use writer::write_to;

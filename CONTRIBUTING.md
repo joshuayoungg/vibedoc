@@ -27,3 +27,14 @@ CI runs the same three commands.
 - `.docx` reading and writing: `crates/inkwell-docx/src/`
 - Painting and input handling: `crates/inkwell-app/src/document_view.rs`
 - Toolbar, find bar, files, shortcuts: `crates/inkwell-app/src/main.rs`
+- Assistant panel, Ctrl+K bar, settings: `crates/inkwell-app/src/assistant.rs`
+- What the assistant is allowed to do: `crates/inkwell-ai/src/tools.rs`
+- The assistant's prompt and request loop: `crates/inkwell-ai/src/agent.rs`
+- AI providers: `crates/inkwell-ai/src/anthropic.rs`, `openai.rs`, `images.rs`
+
+## Adding a tool for the assistant
+
+1. Add a `ToolSpec` to `tool_specs()` in `tools.rs`, with a clear description and JSON schema.
+2. Handle it in `Workspace::run`. Return a short result the model can read, or an error it can correct.
+3. If it moves paragraphs around, keep the user's selection in place with `move_selection`.
+4. Add a test in `crates/inkwell-ai/tests/agent.rs` using `ScriptedModel`. No API key needed.

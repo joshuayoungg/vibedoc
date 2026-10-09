@@ -1,10 +1,10 @@
 //! Reads a .docx into a document. Anything Inkwell doesn't support yet
-//! (tables, images, fonts, colors) is skipped, keeping its text where possible.
+//! (tables, fonts, colors) is skipped, keeping its text where possible.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek};
 
-use inkwell_core::{Document, Paragraph, ParagraphKind, StyledChar, TextStyle};
+use inkwell_core::{Document, Image, PageSetup, Paragraph, ParagraphKind, StyledChar, TextStyle};
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::Reader;
 use zip::ZipArchive;
@@ -19,18 +19,61 @@ pub fn read_from<R: Read + Seek>(input: R) -> Result<Document, Error> {
         Some(numbering) => bullet_list_ids(&numbering)?,
         None => HashMap::new(),
     };
-    parse_body(&body, &bullet_lists)
+    let image_files = read_image_files(&mut zip)?;
+    parse_body(&body, &bullet_lists, &image_files)
 }
 
 fn read_part<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Option<String>, Error> {
+    match read_bytes(zip, name)? {
+        Some(bytes) => Ok(Some(String::from_utf8(bytes)?)),
+        None => Ok(None),
+    }
+}
+
+fn read_bytes<R: Read + Seek>(zip: &mut ZipArchive<R>, name: &str) -> Result<Option<Vec<u8>>, Error> {
     let mut file = match zip.by_name(name) {
         Ok(file) => file,
         Err(zip::result::ZipError::FileNotFound) => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let mut content = String::new();
-    file.read_to_string(&mut content)?;
+    let mut content = Vec::new();
+    file.read_to_end(&mut content)?;
     Ok(Some(content))
+}
+
+/// Loads every image the document links to, keyed by relationship id ("rId5").
+fn read_image_files<R: Read + Seek>(zip: &mut ZipArchive<R>) -> Result<HashMap<String, Vec<u8>>, Error> {
+    let Some(relationships) = read_part(zip, "word/_rels/document.xml.rels")? else {
+        return Ok(HashMap::new());
+    };
+    let mut reader = Reader::from_str(&relationships);
+    let mut image_targets = Vec::new();
+    loop {
+        match reader.read_event()? {
+            Event::Start(tag) | Event::Empty(tag) if tag.name().as_ref() == "Relationship" => {
+                let is_image = attribute(&tag, "Type").is_some_and(|t| t.ends_with("/image"));
+                if let (true, Some(id), Some(target)) =
+                    (is_image, attribute(&tag, "Id"), attribute(&tag, "Target"))
+                {
+                    image_targets.push((id, target));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    let mut files = HashMap::new();
+    for (id, target) in image_targets {
+        // Targets are relative to word/, unless they start with "/".
+        let path = match target.strip_prefix('/') {
+            Some(absolute) => absolute.to_string(),
+            None => format!("word/{target}"),
+        };
+        if let Some(bytes) = read_bytes(zip, &path)? {
+            files.insert(id, bytes);
+        }
+    }
+    Ok(files)
 }
 
 /// What we know about the paragraph and run being read.
@@ -43,12 +86,28 @@ struct ParserState {
     in_text: bool,
     is_list: bool,
     list_id: Option<String>,
+    drawing: Option<Drawing>,
 }
 
-fn parse_body(xml: &str, bullet_lists: &HashMap<String, bool>) -> Result<Document, Error> {
+/// A picture being read: its size in EMUs and which image file it shows.
+#[derive(Default)]
+struct Drawing {
+    width: f32,
+    height: f32,
+    relationship_id: Option<String>,
+}
+
+const EMU_PER_POINT: f32 = 12700.0;
+
+fn parse_body(
+    xml: &str,
+    bullet_lists: &HashMap<String, bool>,
+    image_files: &HashMap<String, Vec<u8>>,
+) -> Result<Document, Error> {
     let mut reader = Reader::from_str(xml);
     let mut state = ParserState::default();
     let mut paragraphs = Vec::new();
+    let mut document = Document::default();
 
     loop {
         match reader.read_event()? {
@@ -64,6 +123,12 @@ fn parse_body(xml: &str, bullet_lists: &HashMap<String, bool>) -> Result<Documen
                 "w:pPr" => state.in_paragraph_properties = false,
                 "w:rPr" => state.in_run_properties = false,
                 "w:t" => state.in_text = false,
+                "w:drawing" => {
+                    if let Some(image) = state.drawing.take().and_then(|d| d.into_image(image_files)) {
+                        let ch = document.add_image(image);
+                        state.push_text(&ch.to_string());
+                    }
+                }
                 _ => {}
             },
             Event::Text(text) if state.in_text => state.push_text(&text.xml10_content()),
@@ -81,7 +146,20 @@ fn parse_body(xml: &str, bullet_lists: &HashMap<String, bool>) -> Result<Documen
             _ => {}
         }
     }
-    Ok(Document::from_paragraphs(paragraphs))
+    if !paragraphs.is_empty() {
+        document.paragraphs = paragraphs;
+    }
+    Ok(document)
+}
+
+impl Drawing {
+    fn into_image(self, image_files: &HashMap<String, Vec<u8>>) -> Option<Image> {
+        let bytes = image_files.get(&self.relationship_id?)?.clone();
+        let page = PageSetup::LETTER;
+        let width = (self.width / EMU_PER_POINT).max(1.0);
+        let height = (self.height / EMU_PER_POINT).max(1.0);
+        Some(Image::fitted(bytes, width, height, page.content_width(), page.content_height()))
+    }
 }
 
 impl ParserState {
@@ -112,6 +190,19 @@ impl ParserState {
             "w:t" => self.in_text = !is_empty,
             "w:tab" if in_run => self.push_text("\t"),
             "w:br" | "w:cr" if in_run => self.push_text(" "),
+            "w:drawing" => self.drawing = Some(Drawing::default()),
+            "wp:extent" => {
+                if let Some(drawing) = self.drawing.as_mut() {
+                    let emus = |name| attribute(tag, name).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                    drawing.width = emus("cx");
+                    drawing.height = emus("cy");
+                }
+            }
+            "a:blip" => {
+                if let Some(drawing) = self.drawing.as_mut() {
+                    drawing.relationship_id = attribute(tag, "r:embed");
+                }
+            }
             _ => {}
         }
     }
@@ -207,7 +298,7 @@ mod tests {
 
     fn parse(body: &str) -> Document {
         let xml = format!(r#"<w:document xmlns:w="x"><w:body>{body}</w:body></w:document>"#);
-        parse_body(&xml, &HashMap::new()).unwrap()
+        parse_body(&xml, &HashMap::new(), &HashMap::new()).unwrap()
     }
 
     #[test]

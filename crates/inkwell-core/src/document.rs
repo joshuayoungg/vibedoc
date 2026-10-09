@@ -3,6 +3,9 @@
 //! Each character carries its own style. That costs a little memory but makes
 //! every edit (insert, delete, restyle) a plain `Vec` operation.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct TextStyle {
     pub bold: bool,
@@ -161,14 +164,42 @@ impl Selection {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A picture in the document, shown at `width` x `height` points.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Image {
+    /// The encoded file (PNG or JPEG). Shared, so undo snapshots stay cheap.
+    pub bytes: Arc<Vec<u8>>,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Image {
+    /// Shrinks the natural size (in points) to fit the box, keeping its shape.
+    pub fn fitted(bytes: Vec<u8>, width: f32, height: f32, max_width: f32, max_height: f32) -> Image {
+        let scale = (max_width / width).min(max_height / height).min(1.0);
+        Image { bytes: Arc::new(bytes), width: width * scale, height: height * scale }
+    }
+}
+
+/// Images sit in the text as one placeholder character from Unicode's private
+/// use area, so editing, undo, and line wrapping treat them like letters.
+/// The character is the key into `Document::images`.
+const FIRST_IMAGE_CHAR: u32 = 0xF0000;
+const LAST_IMAGE_CHAR: u32 = 0xFFFFD;
+
+pub fn is_image_char(ch: char) -> bool {
+    (FIRST_IMAGE_CHAR..=LAST_IMAGE_CHAR).contains(&(ch as u32))
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Document {
     pub paragraphs: Vec<Paragraph>,
+    pub images: HashMap<char, Image>,
 }
 
 impl Default for Document {
     fn default() -> Self {
-        Document { paragraphs: vec![Paragraph::default()] }
+        Document { paragraphs: vec![Paragraph::default()], images: HashMap::new() }
     }
 }
 
@@ -178,8 +209,27 @@ impl Document {
         if paragraphs.is_empty() {
             Document::default()
         } else {
-            Document { paragraphs }
+            Document { paragraphs, images: HashMap::new() }
         }
+    }
+
+    pub fn image(&self, ch: char) -> Option<&Image> {
+        self.images.get(&ch)
+    }
+
+    /// Adds an image to the image table and returns its placeholder character.
+    pub fn add_image(&mut self, image: Image) -> char {
+        let next = self.images.keys().map(|&ch| ch as u32 + 1).max().unwrap_or(FIRST_IMAGE_CHAR);
+        let ch = char::from_u32(next.min(LAST_IMAGE_CHAR)).expect("private use area is valid");
+        self.images.insert(ch, image);
+        ch
+    }
+
+    /// Inserts an image at `at`. Returns the position just after it.
+    pub fn insert_image(&mut self, at: Position, image: Image) -> Position {
+        let ch = self.add_image(image);
+        self.paragraphs[at.paragraph].chars.insert(at.offset, StyledChar { ch, style: TextStyle::default() });
+        Position::new(at.paragraph, at.offset + 1)
     }
 
     pub fn start(&self) -> Position {
@@ -250,7 +300,7 @@ impl Document {
                 text.push('\n');
             }
             let chars = self.chars_of(paragraph, start, end);
-            text.extend(chars.iter().map(|c| c.ch));
+            text.extend(chars.iter().map(|c| c.ch).filter(|&ch| !is_image_char(ch)));
         }
         text
     }
@@ -369,6 +419,20 @@ mod tests {
         let mut p = Paragraph::from_text(ParagraphKind::Normal, "ab", TextStyle::default());
         p.chars.push(StyledChar { ch: 'c', style: bold });
         assert_eq!(p.runs(), vec![(TextStyle::default(), "ab".into()), (bold, "c".into())]);
+    }
+
+    #[test]
+    fn images_are_single_characters_left_out_of_plain_text() {
+        let mut d = doc(&["ab"]);
+        let image = Image::fitted(vec![1, 2, 3], 800.0, 400.0, 400.0, 600.0);
+        assert_eq!((image.width, image.height), (400.0, 200.0));
+        let after = d.insert_image(Position::new(0, 1), image.clone());
+        assert_eq!(after, Position::new(0, 2));
+        let ch = d.paragraphs[0].chars[1].ch;
+        assert!(is_image_char(ch));
+        assert_eq!(d.image(ch), Some(&image));
+        assert_eq!(d.text_in(d.start(), d.end()), "ab");
+        assert_ne!(d.add_image(image), ch);
     }
 
     #[test]

@@ -7,7 +7,8 @@ pub mod find;
 pub mod layout;
 
 pub use document::{
-    Document, Paragraph, ParagraphKind, Position, Selection, StyleFlag, StyledChar, TextStyle,
+    is_image_char, Document, Image, Paragraph, ParagraphKind, Position, Selection, StyleFlag, StyledChar,
+    TextStyle,
 };
 pub use editor::Editor;
 pub use layout::{Layout, Measure, PageSetup};

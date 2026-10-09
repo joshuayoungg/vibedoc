@@ -1,37 +1,100 @@
 //! Writes a document as a .docx (a zip of XML files Word understands).
 
+use std::collections::HashMap;
 use std::io::{Seek, Write};
 
-use inkwell_core::{Document, Paragraph, ParagraphKind, TextStyle};
+use inkwell_core::{Document, Image, Paragraph, ParagraphKind, TextStyle};
 use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
 
 use crate::Error;
 
 const BULLET_NUM_ID: usize = 1;
+/// Word measures drawings in EMUs (English Metric Units).
+const EMU_PER_POINT: f32 = 12700.0;
 
 pub fn write_to<W: Write + Seek>(document: &Document, output: W) -> Result<(), Error> {
-    let (body, numbered_lists) = document_body(document);
+    let media = Media::collect(document);
+    let (body, numbered_lists) = document_body(document, &media);
     let mut zip = ZipWriter::new(output);
     let parts = [
-        ("[Content_Types].xml", CONTENT_TYPES.to_string()),
-        ("_rels/.rels", ROOT_RELS.to_string()),
-        ("word/_rels/document.xml.rels", DOCUMENT_RELS.to_string()),
-        ("word/document.xml", body),
-        ("word/styles.xml", STYLES.to_string()),
-        ("word/numbering.xml", numbering(numbered_lists)),
+        ("[Content_Types].xml".to_string(), CONTENT_TYPES.as_bytes().to_vec()),
+        ("_rels/.rels".to_string(), ROOT_RELS.as_bytes().to_vec()),
+        ("word/_rels/document.xml.rels".to_string(), media.relationships().into_bytes()),
+        ("word/document.xml".to_string(), body.into_bytes()),
+        ("word/styles.xml".to_string(), STYLES.as_bytes().to_vec()),
+        ("word/numbering.xml".to_string(), numbering(numbered_lists).into_bytes()),
     ];
-    for (name, content) in parts {
+    let image_files =
+        media.images.iter().enumerate().map(|(i, image)| (media.path(i, image), image.bytes.to_vec()));
+    for (name, content) in parts.into_iter().chain(image_files) {
         zip.start_file(name, SimpleFileOptions::default())?;
-        zip.write_all(content.as_bytes())?;
+        zip.write_all(&content)?;
     }
     zip.finish()?;
     Ok(())
 }
 
+/// The images a document actually uses, numbered in order of appearance.
+struct Media<'a> {
+    images: Vec<&'a Image>,
+    number_of: HashMap<char, usize>,
+}
+
+impl<'a> Media<'a> {
+    fn collect(document: &'a Document) -> Self {
+        let mut media = Media { images: Vec::new(), number_of: HashMap::new() };
+        for c in document.paragraphs.iter().flat_map(|p| &p.chars) {
+            if let Some(image) = document.image(c.ch) {
+                if !media.number_of.contains_key(&c.ch) {
+                    media.number_of.insert(c.ch, media.images.len());
+                    media.images.push(image);
+                }
+            }
+        }
+        media
+    }
+
+    fn path(&self, index: usize, image: &Image) -> String {
+        format!("word/media/image{}.{}", index + 1, file_extension(image))
+    }
+
+    fn relationships(&self) -> String {
+        let mut xml = String::from(DOCUMENT_RELS_START);
+        for (index, image) in self.images.iter().enumerate() {
+            let target = self.path(index, image).replacen("word/", "", 1);
+            xml.push_str(&format!(
+                r#"<Relationship Id="rIdImage{}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{target}"/>"#,
+                index + 1
+            ));
+        }
+        xml.push_str("</Relationships>");
+        xml
+    }
+
+    /// A `<w:drawing>` run for an image character, or `None` for ordinary text.
+    fn drawing_run(&self, ch: char) -> Option<String> {
+        let index = *self.number_of.get(&ch)?;
+        let image = self.images[index];
+        let (cx, cy) = ((image.width * EMU_PER_POINT) as i64, (image.height * EMU_PER_POINT) as i64);
+        let id = index + 1;
+        Some(format!(
+            r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{cx}" cy="{cy}"/><wp:docPr id="{id}" name="Picture {id}"/><a:graphic xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:pic xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture"><pic:nvPicPr><pic:cNvPr id="{id}" name="image{id}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="rIdImage{id}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{cx}" cy="{cy}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
+        ))
+    }
+}
+
+fn file_extension(image: &Image) -> &'static str {
+    if image.bytes.starts_with(&[0xFF, 0xD8]) {
+        "jpeg"
+    } else {
+        "png"
+    }
+}
+
 /// Builds word/document.xml. Also returns how many separate numbered lists
 /// there are, because each needs its own numbering entry so it starts at 1.
-fn document_body(document: &Document) -> (String, usize) {
+fn document_body(document: &Document, media: &Media) -> (String, usize) {
     let mut xml = String::from(DOCUMENT_START);
     let mut numbered_lists = 0;
     let mut previous_kind = None;
@@ -40,14 +103,14 @@ fn document_body(document: &Document) -> (String, usize) {
             numbered_lists += 1;
         }
         // Numbered list N uses numbering id N + 1 (id 1 is shared by all bullets).
-        xml.push_str(&paragraph_xml(paragraph, BULLET_NUM_ID + numbered_lists));
+        xml.push_str(&paragraph_xml(paragraph, BULLET_NUM_ID + numbered_lists, media));
         previous_kind = Some(paragraph.kind);
     }
     xml.push_str(DOCUMENT_END);
     (xml, numbered_lists)
 }
 
-fn paragraph_xml(paragraph: &Paragraph, numbered_list_id: usize) -> String {
+fn paragraph_xml(paragraph: &Paragraph, numbered_list_id: usize, media: &Media) -> String {
     let properties = match paragraph.kind {
         ParagraphKind::Normal => String::new(),
         ParagraphKind::Heading1 => style_property("Heading1"),
@@ -56,7 +119,7 @@ fn paragraph_xml(paragraph: &Paragraph, numbered_list_id: usize) -> String {
         ParagraphKind::Bullet => list_properties(BULLET_NUM_ID),
         ParagraphKind::Numbered => list_properties(numbered_list_id),
     };
-    let runs: String = paragraph.runs().iter().map(|(style, text)| run_xml(*style, text)).collect();
+    let runs: String = paragraph.runs().iter().map(|(style, text)| runs_xml(*style, text, media)).collect();
     format!("<w:p>{properties}{runs}</w:p>")
 }
 
@@ -70,7 +133,27 @@ fn list_properties(num_id: usize) -> String {
     )
 }
 
-fn run_xml(style: TextStyle, text: &str) -> String {
+/// Text runs, with each image split out into a drawing run of its own.
+fn runs_xml(style: TextStyle, text: &str, media: &Media) -> String {
+    let mut xml = String::new();
+    let mut pending_text = String::new();
+    for ch in text.chars() {
+        match media.drawing_run(ch) {
+            Some(drawing) => {
+                xml.push_str(&text_run_xml(style, &std::mem::take(&mut pending_text)));
+                xml.push_str(&drawing);
+            }
+            None => pending_text.push(ch),
+        }
+    }
+    xml.push_str(&text_run_xml(style, &pending_text));
+    xml
+}
+
+fn text_run_xml(style: TextStyle, text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
     let mut properties = String::new();
     if style.bold {
         properties.push_str("<w:b/>");
@@ -108,18 +191,18 @@ fn escape(text: &str) -> String {
 }
 
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>"#;
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>"#;
 
 const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
 
-const DOCUMENT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/></Relationships>"#;
+const DOCUMENT_RELS_START: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering" Target="numbering.xml"/>"#;
 
 const DOCUMENT_START: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>"#,
     "\n",
-    r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>"#
+    r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"><w:body>"#
 );
 
 // US Letter, one-inch margins (Word measures in twentieths of a point).
@@ -140,7 +223,7 @@ mod tests {
         let numbered = |t| Paragraph::from_text(ParagraphKind::Numbered, t, TextStyle::default());
         let normal = Paragraph::from_text(ParagraphKind::Normal, "x", TextStyle::default());
         let document = Document::from_paragraphs(vec![numbered("a"), numbered("b"), normal, numbered("c")]);
-        let (body, lists) = document_body(&document);
+        let (body, lists) = document_body(&document, &Media::collect(&document));
         assert_eq!(lists, 2);
         assert_eq!(body.matches(r#"w:numId w:val="2""#).count(), 2);
         assert_eq!(body.matches(r#"w:numId w:val="3""#).count(), 1);

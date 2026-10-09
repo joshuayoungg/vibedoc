@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 eframe = "0.36.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+inkwell-ai = { version = "0.1.0", path = "../inkwell-ai" }
 inkwell-core = { version = "0.1.0", path = "../inkwell-core" }
 inkwell-docx = { version = "0.1.0", path = "../inkwell-docx" }
 rfd = "0.17.2"

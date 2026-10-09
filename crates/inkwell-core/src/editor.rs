@@ -225,6 +225,14 @@ impl Editor {
         self.mark_changed();
     }
 
+    /// Swaps in an edited copy of the document (the AI's work) as one undo step.
+    pub fn replace_document(&mut self, document: Document) {
+        self.record(EditKind::Other);
+        self.document = document;
+        self.set_selection(self.selection);
+        self.mark_changed();
+    }
+
     pub fn current_paragraph_kind(&self) -> ParagraphKind {
         self.document.paragraphs[self.selection.cursor.paragraph].kind
     }
@@ -387,6 +395,18 @@ mod tests {
         let chars = &e.document().paragraphs[0].chars;
         assert!(!chars[0].style.bold);
         assert!(chars[1].style.bold);
+    }
+
+    #[test]
+    fn replacing_the_document_is_one_undo_step() {
+        let mut e = Editor::default();
+        e.type_text("before");
+        let mut edited = e.document().clone();
+        edited.insert_text(Position::new(0, 0), "x\ny\n", TextStyle::default());
+        e.replace_document(edited);
+        assert_eq!(text(&e), ["x", "y", "before"]);
+        e.undo();
+        assert_eq!(text(&e), ["before"]);
     }
 
     #[test]

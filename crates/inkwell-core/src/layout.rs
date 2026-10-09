@@ -47,7 +47,10 @@ pub struct Glyph {
 pub struct Line {
     pub page: usize,
     pub y: f32,
+    /// Full height, including any image taller than the text.
     pub height: f32,
+    /// Height of one line of text; text sits at the bottom of the line.
+    pub text_height: f32,
     pub paragraph: usize,
     pub kind: ParagraphKind,
     /// Character offsets in the paragraph covered by this line (`end` is exclusive).
@@ -118,14 +121,27 @@ impl Layout {
             let kind = paragraph.kind;
             list_number = if kind == ParagraphKind::Numbered { list_number + 1 } else { 0 };
             let indent = if kind.is_list() { LIST_INDENT } else { 0.0 };
-            let height = measure.line_height(kind);
-            let widths: Vec<f32> =
-                paragraph.chars.iter().map(|c| measure.char_width(c.ch, c.style, kind)).collect();
+            let text_height = measure.line_height(kind);
+            let max_width = page_setup.content_width() - indent;
+            let widths: Vec<f32> = paragraph
+                .chars
+                .iter()
+                .map(|c| match document.image(c.ch) {
+                    Some(image) => image.width.min(max_width),
+                    None => measure.char_width(c.ch, c.style, kind),
+                })
+                .collect();
             let chars: Vec<char> = paragraph.chars.iter().map(|c| c.ch).collect();
-            let ranges = wrap(&chars, &widths, page_setup.content_width() - indent);
+            let ranges = wrap(&chars, &widths, max_width);
             let line_count = ranges.len();
 
             for (line_index, (start, end)) in ranges.into_iter().enumerate() {
+                let tallest_image = chars[start..end]
+                    .iter()
+                    .filter_map(|&ch| document.image(ch))
+                    .map(|image| image.height)
+                    .fold(0.0, f32::max);
+                let height = text_height.max(tallest_image);
                 if y + height > page_setup.content_height() && y > 0.0 {
                     page += 1;
                     y = 0.0;
@@ -149,6 +165,7 @@ impl Layout {
                     page,
                     y,
                     height,
+                    text_height,
                     paragraph: index,
                     kind,
                     start,
@@ -160,7 +177,7 @@ impl Layout {
                 });
                 y += height;
             }
-            y += paragraph_spacing(kind, height);
+            y += paragraph_spacing(kind, text_height);
         }
 
         Layout { page_setup, lines, page_count: page + 1 }
@@ -345,6 +362,22 @@ mod tests {
         let l = layout(&["hello big world"]);
         assert_eq!(l.vertical_move(Position::new(0, 2), true, 20.0), Position::new(0, 12));
         assert_eq!(l.vertical_move(Position::new(0, 12), false, 20.0), Position::new(0, 2));
+    }
+
+    #[test]
+    fn images_widen_and_heighten_their_line() {
+        let mut document = Document::from_paragraphs(vec![Paragraph::from_text(
+            ParagraphKind::Normal,
+            "ab",
+            TextStyle::default(),
+        )]);
+        let image = crate::document::Image::fitted(vec![], 30.0, 50.0, 100.0, 100.0);
+        document.insert_image(Position::new(0, 1), image);
+        let l = Layout::build(&document, SMALL_PAGE, &FixedMeasure);
+        let line = &l.lines[0];
+        assert_eq!(line.height, 50.0);
+        assert_eq!(line.text_height, 20.0);
+        assert_eq!(line.x_of(2), 40.0);
     }
 
     #[test]
